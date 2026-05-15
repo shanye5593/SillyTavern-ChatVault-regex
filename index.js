@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.5';
+const VERSION = '0.5.17-regex.6';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -1914,33 +1914,58 @@ function renderRichMd(raw) {
     return out.join('');
 }
 
-// DOMPurify 白名单：允许 AI 内联样式 / 表格 / details 等，砍掉 script/iframe/事件/危险协议
-function sanitizeMd(html) {
+// DOMPurify 双模式白名单
+// safe 模式（默认 / 总开关 OFF）：与 v0.5.16 正式版一致，砍 <style>/<script>/<iframe>/事件
+// permissive 模式（总开关 ON）：放行 <style> + 更多布局/语义属性，让酒馆"美化/状态栏"正则的 UI 能正常渲染
+//   仍然砍 <script>/<iframe>/<object>/<embed>/<form> 等关键 XSS 载体 + 所有 on*= 事件 + javascript: URI
+const _DP_SAFE_CFG = {
+    ALLOWED_TAGS: [
+        'p', 'br', 'span', 'div', 'strong', 'em', 'b', 'i', 'u', 's', 'del', 'ins',
+        'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'hr',
+        'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th',
+        'sub', 'sup', 'small', 'mark', 'details', 'summary', 'font', 'a', 'img',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'figure', 'figcaption',
+        'kbd', 'abbr', 'q', 'cite', 'time', 'ruby', 'rt', 'rp', 'bdi', 'bdo', 'wbr',
+        'dl', 'dt', 'dd',
+    ],
+    ALLOWED_ATTR: [
+        'style', 'class', 'title', 'colspan', 'rowspan',
+        'align', 'color', 'size', 'face', 'open',
+        'href', 'target', 'rel', 'alt', 'src',
+    ],
+    ALLOWED_URI_REGEXP: /^(?:https?|mailto|data:image\/(?:png|jpeg|gif|webp|svg\+xml)):/i,
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'textarea', 'select', 'link', 'meta', 'base', 'style'],
+    FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onmouseenter', 'onmouseleave', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress', 'onanimationend', 'onanimationstart', 'ontransitionend'],
+};
+// permissive：基于 safe，把 <style> 从 FORBID 移到 ALLOWED；增加常见布局/无障碍属性 + svg 子集
+const _DP_PERMISSIVE_CFG = {
+    ALLOWED_TAGS: _DP_SAFE_CFG.ALLOWED_TAGS.concat([
+        'style',
+        // SVG 基础（状态栏图标常用）
+        'svg', 'g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'text', 'tspan', 'defs', 'use', 'symbol', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern', 'filter', 'feGaussianBlur', 'feOffset', 'feMerge', 'feMergeNode',
+    ]),
+    ALLOWED_ATTR: _DP_SAFE_CFG.ALLOWED_ATTR.concat([
+        'id', 'name', 'role', 'tabindex',
+        'aria-label', 'aria-hidden', 'aria-expanded', 'aria-controls',
+        'data-*',  // DOMPurify 默认即放行 data-* (ALLOW_DATA_ATTR=true)，列在这里更醒目
+        // SVG 常用
+        'viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'd', 'cx', 'cy', 'r', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'points', 'transform', 'preserveAspectRatio', 'opacity', 'fill-opacity', 'stroke-opacity', 'fill-rule', 'stroke-linecap', 'stroke-linejoin',
+        'width', 'height',
+    ]),
+    ALLOWED_URI_REGEXP: _DP_SAFE_CFG.ALLOWED_URI_REGEXP,
+    // 关键 XSS 载体仍 FORBID；只把 'style' 从黑名单中拿掉
+    FORBID_TAGS: _DP_SAFE_CFG.FORBID_TAGS.filter(t => t !== 'style'),
+    FORBID_ATTR: _DP_SAFE_CFG.FORBID_ATTR,
+};
+
+function sanitizeMd(html, mode) {
     if (!html) return '';
     const DP = (typeof window !== 'undefined') ? window.DOMPurify : null;
     if (DP && typeof DP.sanitize === 'function') {
         try {
-            return DP.sanitize(html, {
-                ALLOWED_TAGS: [
-                    'p', 'br', 'span', 'div', 'strong', 'em', 'b', 'i', 'u', 's', 'del', 'ins',
-                    'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'hr',
-                    'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th',
-                    'sub', 'sup', 'small', 'mark', 'details', 'summary', 'font', 'a', 'img',
-                    // v0.5.13 扩展：标题 + 语义 + 图配说明 + 定义列表
-                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-                    'figure', 'figcaption',
-                    'kbd', 'abbr', 'q', 'cite', 'time', 'ruby', 'rt', 'rp', 'bdi', 'bdo', 'wbr',
-                    'dl', 'dt', 'dd',
-                ],
-                ALLOWED_ATTR: [
-                    'style', 'class', 'title', 'colspan', 'rowspan',
-                    'align', 'color', 'size', 'face', 'open',
-                    'href', 'target', 'rel', 'alt', 'src',
-                ],
-                ALLOWED_URI_REGEXP: /^(?:https?|mailto|data:image\/(?:png|jpeg|gif|webp|svg\+xml)):/i,
-                FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'textarea', 'select', 'link', 'meta', 'base', 'style'],
-                FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onmouseenter', 'onmouseleave', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress', 'onanimationend', 'onanimationstart', 'ontransitionend'],
-            });
+            const cfg = (mode === 'permissive') ? _DP_PERMISSIVE_CFG : _DP_SAFE_CFG;
+            return DP.sanitize(html, cfg);
         } catch (e) {
             console.warn('[ChatVault] DOMPurify.sanitize 抛错，按 fail-closed 退化为字面文本：', e);
         }
@@ -2138,13 +2163,16 @@ function renderReader() {
     // v0.5.15 fix: renderReader 顶层没有 s 变量，必须显式 load
     const _readerCfg = loadSettings();
     const _useRichRender = _readerCfg.readerRichRender !== false;
+    // v0.5.17-regex.6 双模式 DOMPurify：开了酒馆正则 → permissive（放行 <style>/SVG 等让美化正则生效）
+    // 关闭 → safe（与正式版一致）
+    const _sanitizeMode = _tavRules ? 'permissive' : 'safe';
 
     const cardHtml = slice.map(m => {
         const who = escapeHtml(m.who);
         // m.text 已经过【酒馆正则 → strip → extract】处理（v0.5.17-regex.5 起在 _processed 缓存层完成）
         const text = m.text
             ? ((_useRichRender
-                    ? sanitizeMd(renderRichMd(m.text))
+                    ? sanitizeMd(renderRichMd(m.text), _sanitizeMode)
                     : renderLiteMd(m.text))
                 || '<span class="cv-reader-empty">（空）</span>')
             : '<span class="cv-reader-empty">（空）</span>';
@@ -4071,9 +4099,10 @@ function injectSettings() {
                 </label>
                 <div class="cv-settings-hint" style="margin-top:6px;">
                   ⚠️ <b>这是真正"通电"开关</b>：开启后，下方<b>勾选了「在 ChatVault 启用」</b>的正则会在阅读消息时执行替换。<br>
-                  ⚠️ 含 ⚠ 危险标记的正则可能引入 XSS（脚本/事件/iframe 等）。最终会经 ChatVault 的 DOMPurify 兜底，但仍建议仔细审查。<br>
+                  🎨 <b>同时渲染白名单自动放宽</b>：放行 <code>&lt;style&gt;</code> 标签 + SVG + id/aria/data-* 等属性，让酒馆"美化正则/状态栏"的 UI 能正常显示。<br>
+                  ⚠️ 含 ⚠ 危险标记的正则可能引入 XSS（脚本/事件/iframe 等仍由 DOMPurify 兜底砍掉），但仍建议仔细审查。<br>
                   ⚠️ 正则若写得太宽松可能导致页面卡顿（catastrophic backtrack）。<br>
-                  💡 <b>关闭此开关 = 完全回归正式版行为</b>，引擎彻底旁路、零开销、零副作用。
+                  💡 <b>关闭此开关 = 完全回归正式版行为</b>，引擎彻底旁路 + DOMPurify 回到严格模式，零开销、零副作用。
                 </div>
               </div>
               <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
