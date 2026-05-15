@@ -2276,3 +2276,9 @@
 .cv-regex-char-row.cv-regex-loading { opacity: 0.6; pointer-events: none; }
 .cv-regex-char-cb { margin: 0; flex-shrink: 0; }
 .cv-regex-char-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+
+/* v0.5.17-regex.2 ChatVault 启用勾选框 + 启用态高亮 */
+.cv-regex-cv-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: 0.78em; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.12); cursor: pointer; user-select: none; }
+.cv-regex-cv-toggle input { margin: 0; }
+.cv-regex-cv-on { border-color: rgba(80,180,120,0.55); background: rgba(80,180,120,0.06); }
+.cv-regex-cv-on .cv-regex-cv-toggle { background: rgba(80,180,120,0.22); color: #4caf6a; font-weight: 600; }

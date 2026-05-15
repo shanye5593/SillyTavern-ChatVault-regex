@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.1';
+const VERSION = '0.5.17-regex.2';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -83,6 +83,9 @@ const DEFAULT_SETTINGS = {
     readerRichRender: true,
     // v0.5.17-regex 已勾选同步正则的角色卡 avatar 列表（懒加载，只在勾选时拉取）
     regexSyncedAvatars: [],
+    // v0.5.17-regex.2 每条正则在 ChatVault 中是否启用（仅记录，未接渲染管线）
+    // 形如 { global: { '<regex.id>': true, ... }, byChar: { '<avatar>': { '<regex.id>': true } } }
+    regexEnabled: { global: {}, byChar: {} },
 };
 
 function loadSettings() {
@@ -1450,8 +1453,39 @@ async function fetchCharacterRegexInto(avatar, name) {
     }
 }
 
+// 读 / 写 ChatVault 启用状态（独立于酒馆原生启用）
+function isRegexEnabledInCv(scope, id) {
+    if (!id) return false;
+    try {
+        const cur = loadSettings();
+        const map = cur.regexEnabled || { global: {}, byChar: {} };
+        if (scope === 'global') return !!(map.global && map.global[id]);
+        return !!(map.byChar && map.byChar[scope] && map.byChar[scope][id]);
+    } catch { return false; }
+}
+function setRegexEnabledInCv(scope, id, enabled) {
+    if (!id) return;
+    const cur = loadSettings();
+    const map = JSON.parse(JSON.stringify(cur.regexEnabled || { global: {}, byChar: {} }));
+    if (!map.global) map.global = {};
+    if (!map.byChar) map.byChar = {};
+    if (scope === 'global') {
+        if (enabled) map.global[id] = true;
+        else delete map.global[id];
+    } else {
+        if (!map.byChar[scope]) map.byChar[scope] = {};
+        if (enabled) map.byChar[scope][id] = true;
+        else {
+            delete map.byChar[scope][id];
+            if (Object.keys(map.byChar[scope]).length === 0) delete map.byChar[scope];
+        }
+    }
+    saveSettings({ ...cur, regexEnabled: map });
+}
+
 // 渲染单条正则的卡片 HTML（折叠卡片，标题行 + 展开后的 find/replace/trim/属性）
-function renderRegexItemHtml(it, key) {
+// scope: 'global' 或 角色 avatar 字符串（决定 ChatVault 启用状态存哪里）
+function renderRegexItemHtml(it, key, scope) {
     const dangerHtml = it.dangers.length
         ? `<span class="cv-regex-danger" title="替换内容里命中可执行/危险模式">⚠ ${it.dangers.map(escapeHtml).join(' / ')}</span>`
         : '';
@@ -1459,8 +1493,8 @@ function renderRegexItemHtml(it, key) {
         ? it.placements.map(p => `<span class="cv-regex-tag">${escapeHtml(p)}</span>`).join('')
         : '<span class="cv-regex-tag cv-regex-tag-mute">(无作用范围)</span>';
     const stateHtml = it.disabled
-        ? '<span class="cv-regex-state cv-regex-disabled">已禁用</span>'
-        : '<span class="cv-regex-state cv-regex-enabled">已启用</span>';
+        ? '<span class="cv-regex-state cv-regex-disabled">酒馆已禁用</span>'
+        : '<span class="cv-regex-state cv-regex-enabled">酒馆已启用</span>';
     const depthHtml = (it.minDepth != null || it.maxDepth != null)
         ? `<span class="cv-regex-meta">深度 ${it.minDepth ?? '∞'} ~ ${it.maxDepth ?? '∞'}</span>`
         : '';
@@ -1469,13 +1503,21 @@ function renderRegexItemHtml(it, key) {
         it.promptOnly   ? '仅格式提示词' : '',
         it.runOnEdit    ? '编辑时运行' : '',
     ].filter(Boolean).map(t => `<span class="cv-regex-meta">${escapeHtml(t)}</span>`).join('');
+    const cvOn = !!(it.id && scope) && isRegexEnabledInCv(scope, it.id);
+    const cvToggleHtml = it.id
+        ? `<label class="cv-regex-cv-toggle" title="勾上后该条正则会被 ChatVault 记住要启用（当前未通电，不影响渲染）">
+             <input type="checkbox" class="cv-regex-cv-cb" data-regex-id="${escapeHtml(it.id)}" data-regex-scope="${escapeHtml(scope || '')}" ${cvOn ? 'checked' : ''}>
+             <span>在 ChatVault 启用</span>
+           </label>`
+        : `<span class="cv-regex-meta" title="缺少 id，无法独立控制">无 id</span>`;
     return `
-      <div class="cv-regex-item ${it.dangers.length ? 'cv-regex-has-danger' : ''}" data-key="${escapeHtml(key)}">
+      <div class="cv-regex-item ${it.dangers.length ? 'cv-regex-has-danger' : ''} ${cvOn ? 'cv-regex-cv-on' : ''}" data-key="${escapeHtml(key)}">
         <div class="cv-regex-head">
           <button class="cv-regex-toggle" type="button" title="展开/收起">▶</button>
           <span class="cv-regex-name">${escapeHtml(it.name)}</span>
           ${stateHtml}
           ${dangerHtml}
+          ${cvToggleHtml}
         </div>
         <div class="cv-regex-tags">
           ${placementHtml}
@@ -3796,60 +3838,6 @@ function injectSettings() {
           </div>
           <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
 
-          <!-- 酒馆正则只读列表（v0.5.17-regex.1 实验功能；只展示，不接渲染） -->
-          <div class="inline-drawer cv-sub-drawer" id="cv_regex_drawer">
-            <div class="inline-drawer-toggle inline-drawer-header">
-              <b>🧪 酒馆正则列表（实验/只读）</b>
-              <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-            </div>
-            <div class="inline-drawer-content">
-              <div class="cv-settings-hint" style="margin-bottom:8px;">
-                ⚠️ <b>实验功能</b>：仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入、不会影响阅读模式渲染。<br>
-                ⚙️ 要新增/编辑/删除正则，请到酒馆原生「正则」扩展面板操作。
-              </div>
-
-              <!-- 子折叠 1：全局正则 -->
-              <div class="inline-drawer cv-sub-drawer" id="cv_regex_global_drawer" style="margin-top:8px;">
-                <div class="inline-drawer-toggle inline-drawer-header">
-                  <b>🌐 全局正则 <span id="cv_regex_global_count" class="cv-regex-count">…</span></b>
-                  <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                </div>
-                <div class="inline-drawer-content">
-                  <div class="cv-settings-row">
-                    <button id="cv_regex_global_refresh" class="menu_button cv-inline-btn">🔄 重新扫描全局</button>
-                    <span id="cv_regex_global_summary" class="cv-settings-hint" style="margin-left:8px;"></span>
-                  </div>
-                  <div id="cv_regex_global_list" class="cv-regex-list" style="margin-top:8px;"></div>
-                </div>
-              </div>
-
-              <!-- 子折叠 2：角色卡正则同步 -->
-              <div class="inline-drawer cv-sub-drawer" id="cv_regex_char_drawer" style="margin-top:8px;">
-                <div class="inline-drawer-toggle inline-drawer-header">
-                  <b>🎭 角色卡正则同步 <span id="cv_regex_char_count" class="cv-regex-count">…</span></b>
-                  <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                </div>
-                <div class="inline-drawer-content">
-                  <div class="cv-settings-hint" style="margin-bottom:8px;">
-                    💡 酒馆按需加载角色卡数据，<b>没勾选的卡完全不读取</b>，不占加载时间。<br>
-                    勾选立即拉取该卡的正则；取消勾选立即从下方列表移除。
-                  </div>
-                  <div class="cv-settings-row" style="gap:6px; flex-wrap:wrap;">
-                    <input type="text" id="cv_regex_char_filter" class="text_pole" placeholder="搜索角色名…" style="flex:1; min-width:160px;">
-                    <button id="cv_regex_char_rescan" class="menu_button cv-inline-btn" title="重新拉取所有已勾选角色的正则">🔄 重扫已勾选</button>
-                  </div>
-                  <div id="cv_regex_char_picker" class="cv-regex-char-picker" style="margin-top:8px;"></div>
-                  <hr style="border:none; border-top:1px dashed var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
-                  <div class="cv-settings-hint" style="opacity:0.85;">
-                    📜 已勾选角色的正则：
-                  </div>
-                  <div id="cv_regex_char_list" class="cv-regex-list" style="margin-top:6px;"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
-
           <!-- 字体设置（折叠） -->
           <div class="inline-drawer cv-sub-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
@@ -3916,6 +3904,60 @@ function injectSettings() {
             </div>
           </div>
 
+          <!-- 酒馆正则列表（v0.5.17-regex.2 实验功能；只展示 + 标记 ChatVault 启用，未接渲染） -->
+          <div class="inline-drawer cv-sub-drawer" id="cv_regex_drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+              <b>酒馆正则列表（实验/只读）</b>
+              <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+              <div class="cv-settings-hint" style="margin-bottom:8px;">
+                ⚠️ <b>实验功能</b>：仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入、不会影响阅读模式渲染。<br>
+                💡 「在 ChatVault 启用」勾选框只是记录意向，<b>当前未通电</b>——勾上也不会跑。<br>
+                ⚙️ 要新增/编辑/删除正则，请到酒馆原生「正则」扩展面板操作。
+              </div>
+
+              <!-- 子折叠 1：全局正则 -->
+              <div class="inline-drawer cv-sub-drawer" id="cv_regex_global_drawer" style="margin-top:8px;">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                  <b>全局正则 <span id="cv_regex_global_count" class="cv-regex-count">…</span></b>
+                  <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                  <div class="cv-settings-row">
+                    <button id="cv_regex_global_refresh" class="menu_button cv-inline-btn">🔄 重新扫描全局</button>
+                    <span id="cv_regex_global_summary" class="cv-settings-hint" style="margin-left:8px;"></span>
+                  </div>
+                  <div id="cv_regex_global_list" class="cv-regex-list" style="margin-top:8px;"></div>
+                </div>
+              </div>
+
+              <!-- 子折叠 2：角色卡正则同步 -->
+              <div class="inline-drawer cv-sub-drawer" id="cv_regex_char_drawer" style="margin-top:8px;">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                  <b>角色卡正则同步 <span id="cv_regex_char_count" class="cv-regex-count">…</span></b>
+                  <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                  <div class="cv-settings-hint" style="margin-bottom:8px;">
+                    💡 酒馆按需加载角色卡数据，<b>没勾选的卡完全不读取</b>，不占加载时间。<br>
+                    勾选立即拉取该卡的正则；取消勾选立即从下方列表移除。
+                  </div>
+                  <div class="cv-settings-row" style="gap:6px; flex-wrap:wrap;">
+                    <input type="text" id="cv_regex_char_filter" class="text_pole" placeholder="搜索角色名…" style="flex:1; min-width:160px;">
+                    <button id="cv_regex_char_rescan" class="menu_button cv-inline-btn" title="重新拉取所有已勾选角色的正则">🔄 重扫已勾选</button>
+                  </div>
+                  <div id="cv_regex_char_picker" class="cv-regex-char-picker" style="margin-top:8px;"></div>
+                  <hr style="border:none; border-top:1px dashed var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
+                  <div class="cv-settings-hint" style="opacity:0.85;">
+                    已勾选角色的正则：
+                  </div>
+                  <div id="cv_regex_char_list" class="cv-regex-list" style="margin-top:6px;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div class="cv-settings-hint">
             v${VERSION} · 设置实时生效，主题切换会立即应用到已打开的面板。
           </div>
@@ -3963,7 +4005,7 @@ function injectSettings() {
             globalListEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">酒馆里没有全局正则。</div>`;
         } else {
             globalListEl.innerHTML = data.global
-                .map((it, idx) => renderRegexItemHtml(it, 'g-' + idx))
+                .map((it, idx) => renderRegexItemHtml(it, 'g-' + idx, 'global'))
                 .join('');
         }
         if (data.errors.length) {
@@ -4032,19 +4074,19 @@ function injectSettings() {
         charListEl.innerHTML = groups.map((g, gi) => {
             if (g.error) {
                 return `<div class="cv-regex-group">
-                  <div class="cv-regex-group-head">🎭 ${escapeHtml(g.name)} <span class="cv-regex-danger">⚠ 拉取失败</span></div>
+                  <div class="cv-regex-group-head">${escapeHtml(g.name)} <span class="cv-regex-danger">⚠ 拉取失败</span></div>
                   <div class="cv-settings-hint" style="color:#e15555; padding:4px;">${escapeHtml(g.error)}</div>
                 </div>`;
             }
             if (g.scripts.length === 0) {
                 return `<div class="cv-regex-group">
-                  <div class="cv-regex-group-head">🎭 ${escapeHtml(g.name)} <span class="cv-regex-count">0</span></div>
+                  <div class="cv-regex-group-head">${escapeHtml(g.name)} <span class="cv-regex-count">0</span></div>
                   <div class="cv-settings-hint" style="opacity:0.7; padding:4px;">该角色卡没有绑定正则。</div>
                 </div>`;
             }
             return `<div class="cv-regex-group">
-              <div class="cv-regex-group-head">🎭 ${escapeHtml(g.name)} <span class="cv-regex-count">${g.scripts.length}</span></div>
-              ${g.scripts.map((it, i) => renderRegexItemHtml(it, `c${gi}-${i}`)).join('')}
+              <div class="cv-regex-group-head">${escapeHtml(g.name)} <span class="cv-regex-count">${g.scripts.length}</span></div>
+              ${g.scripts.map((it, i) => renderRegexItemHtml(it, `c${gi}-${i}`, g.avatar)).join('')}
             </div>`;
         }).join('');
     };
@@ -4069,8 +4111,21 @@ function injectSettings() {
             } catch { /* ignore */ }
         }
     };
+    // ChatVault 启用勾选框：change 事件单独处理
+    const regexCvToggleHandler = (e) => {
+        const cb = e.target.closest('.cv-regex-cv-cb');
+        if (!cb) return;
+        const id = cb.dataset.regexId;
+        const scope = cb.dataset.regexScope;
+        if (!id) return;
+        setRegexEnabledInCv(scope, id, cb.checked);
+        const card = cb.closest('.cv-regex-item');
+        if (card) card.classList.toggle('cv-regex-cv-on', cb.checked);
+    };
     globalListEl.addEventListener('click', regexCardEvtHandler);
     charListEl.addEventListener('click', regexCardEvtHandler);
+    globalListEl.addEventListener('change', regexCvToggleHandler);
+    charListEl.addEventListener('change', regexCvToggleHandler);
 
     // 全局重扫
     wrap.querySelector('#cv_regex_global_refresh').addEventListener('click', (e) => {
