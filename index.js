@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.11';
+const VERSION = '0.5.17-regex.12';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -2044,29 +2044,37 @@ function _escapeAttr(s) {
 // 因为 sandbox 不带 allow-same-origin，脚本能跑但拿不到父 DOM；只能 postMessage
 function _buildResizerScript(id) {
     const idLit = JSON.stringify(id);
-    // v0.5.17-regex.11：防无限增长
-    //  - body 默认 margin:8 + html 100% 高度撑满 viewport，会跟父侧设的 iframe 高度形成反馈循环
-    //    （父设 H → iframe 内 documentElement 撑到 H → ResizeObserver 报 H+margin → 父再设 H+...）
-    //  - 修法：① 内置 CSS 把 html/body 高度归零、margin 归零；② 测量改用 body.scrollHeight 而非
-    //    documentElement.scrollHeight；③ 仅在变化 > 2px 时上报；④ debounce 100ms 合并连发
+    // v0.5.17-regex.12：不再注入会覆盖用户卡的 CSS（v0.5.17-regex.11 用 height:auto 把状态栏卡压扁渲染不出来）
+    //  - 反馈循环用"双向阈值 + debounce"控制，不动用户 CSS
+    //  - 测量综合 scrollHeight / offsetHeight（不同卡布局兼容性更好）
+    //  - 仅在变化 > 4px 时才上报（之前 2px 在 iOS 像素比下仍可能抖）
     // 注意：</script> 必须用 <\/script> 防止内嵌字符串提前关闭外层 script
-    return `<style>html,body{margin:0;padding:0;height:auto;min-height:0;background:transparent}</style>`
-        + `<script>(function(){
+    return `<script>(function(){
 var _id=${idLit},_last=-1,_t=null;
-function measure(){var b=document.body;return b?b.scrollHeight:0;}
+function measure(){
+  var b=document.body,h=document.documentElement;
+  if(!b&&!h)return 0;
+  return Math.max(
+    b?b.scrollHeight:0, b?b.offsetHeight:0,
+    h?h.scrollHeight:0, h?h.offsetHeight:0
+  );
+}
 function send(){
   var h=measure();
-  if(h<=0||Math.abs(h-_last)<2)return;
+  if(h<=0||Math.abs(h-_last)<4)return;
   _last=h;
   try{parent.postMessage({type:'cv-iframe-h',id:_id,h:h},'*');}catch(e){}
 }
-function schedule(){if(_t)return;_t=setTimeout(function(){_t=null;send();},100);}
+function schedule(){if(_t)return;_t=setTimeout(function(){_t=null;send();},120);}
 if(document.readyState==='complete')schedule();
 else window.addEventListener('load',schedule);
-try{var ro=new ResizeObserver(schedule);if(document.body)ro.observe(document.body);
-    else window.addEventListener('DOMContentLoaded',function(){ro.observe(document.body);});}catch(e){}
+try{
+  var ro=new ResizeObserver(schedule);
+  function attach(){try{ro.observe(document.documentElement);if(document.body)ro.observe(document.body);}catch(e){}}
+  if(document.body)attach();else window.addEventListener('DOMContentLoaded',attach);
+}catch(e){}
 window.addEventListener('resize',schedule);
-setTimeout(send,400);setTimeout(send,1500);
+setTimeout(send,400);setTimeout(send,1500);setTimeout(send,3000);
 })();<\/script>`;
 }
 
@@ -2085,15 +2093,15 @@ let _cvIframeMsgListenerAttached = false;
 function _ensureIframeMsgListener() {
     if (_cvIframeMsgListenerAttached) return;
     _cvIframeMsgListenerAttached = true;
-    // 父侧也防抖：记录每个 iframe 上一次设的高度，差 < 2px 直接忽略，杜绝反馈循环
+    // 父侧也防抖：记录每个 iframe 上一次设的高度，差 < 4px 直接忽略，杜绝反馈循环
     const _lastH = new Map();
     window.addEventListener('message', (ev) => {
         const d = ev && ev.data;
         if (!d || d.type !== 'cv-iframe-h' || typeof d.id !== 'string' || typeof d.h !== 'number') return;
-        // clamp：最小 1px（让加载初期没内容时 iframe 不占位）；最大 6000px 防恶意/失控撑爆
-        const h = Math.max(1, Math.min(6000, Math.floor(d.h)));
+        // clamp：最小 40px 兜底（防初次空报告导致整卡塌缩）；最大 6000px 防恶意/失控撑爆
+        const h = Math.max(40, Math.min(6000, Math.floor(d.h)));
         const prev = _lastH.get(d.id);
-        if (prev != null && Math.abs(prev - h) < 2) return;
+        if (prev != null && Math.abs(prev - h) < 4) return;
         _lastH.set(d.id, h);
         try {
             const sel = (typeof CSS !== 'undefined' && CSS.escape)
@@ -2355,11 +2363,12 @@ function renderReader() {
             const ifrId = `cv-ifr-${readerState.character?.avatar || 'x'}-${m.idx}`;
             const wrapped = _wrapDocWithResizer(m.iframeSrc, ifrId);
             // sandbox="allow-scripts" → JS 能跑（状态栏交互可工作），但视为 null origin（DOM 隔离 / 不能读 cookie）
-            // v0.5.17-regex.11：去掉 min-height（避免空白占位条）+ 去掉 loading=lazy（避免占位灰条）
-            // + scrolling=no（防内部生成滚动条）+ 初始 height:0（postMessage 后才撑高）
+            // v0.5.17-regex.12：初始给 60px 兜底高度（v0.5.17-regex.11 的 height:0 在 postMessage 没到时
+            // 整张卡完全不可见 —— 用户卡 CSS 复杂，宁可初始有点空白也不要彻底瞎）
+            // postMessage 到达后会被替换为实际高度
             const ifrTag = `<iframe class="cv-msg-iframe" data-cv-iframe-id="${_escapeAttr(ifrId)}" `
                  + `sandbox="allow-scripts" referrerpolicy="no-referrer" scrolling="no" `
-                 + `style="width:100%;border:0;background:transparent;display:block;height:0;" `
+                 + `style="width:100%;border:0;background:transparent;display:block;height:60px;" `
                  + `srcdoc="${_escapeAttr(wrapped)}"></iframe>`;
             // 前后文本走原管线（已 strip/extract，再 markdown + sanitize）
             const beforeT = (m.iframeBefore || '').trim();
