@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.6';
+const VERSION = '0.5.17-regex.7';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -1939,19 +1939,30 @@ const _DP_SAFE_CFG = {
     FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onmouseenter', 'onmouseleave', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress', 'onanimationend', 'onanimationstart', 'ontransitionend'],
 };
 // permissive：基于 safe，把 <style> 从 FORBID 移到 ALLOWED；增加常见布局/无障碍属性 + svg 子集
+// v0.5.17-regex.7 P0 安全修复：
+//   - 不再放行 <use> / <symbol>（避免 <use href="data:..."> 跨源 SVG XSS）
+//   - 不再放行 id / name（避免 <img id="cv_body"> DOM clobbering 劫持 ChatVault 自身 getElementById）
+//   - 删除 xmlns 属性放行（SVG 命名空间漏洞防护，Mutation XSS）
+//   - <style> 内 @import / expression() / 危险 url() 由 _hardenStyleHook 后处理清理
 const _DP_PERMISSIVE_CFG = {
     ALLOWED_TAGS: _DP_SAFE_CFG.ALLOWED_TAGS.concat([
         'style',
-        // SVG 基础（状态栏图标常用）
-        'svg', 'g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'text', 'tspan', 'defs', 'use', 'symbol', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern', 'filter', 'feGaussianBlur', 'feOffset', 'feMerge', 'feMergeNode',
+        // SVG 基础（状态栏图标常用）—— 注意：use / symbol / foreignObject / image 一律 NOT 放行
+        'svg', 'g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'text', 'tspan',
+        'defs', 'linearGradient', 'radialGradient', 'stop',
+        'clipPath', 'mask', 'pattern',
+        'filter', 'feGaussianBlur', 'feOffset', 'feMerge', 'feMergeNode',
     ]),
     ALLOWED_ATTR: _DP_SAFE_CFG.ALLOWED_ATTR.concat([
-        'id', 'name', 'role', 'tabindex',
+        // 仅放行无害的语义/无障碍属性 —— 故意不含 id / name / xmlns（DOM clobbering & SVG 命名空间风险）
+        'role', 'tabindex',
         'aria-label', 'aria-hidden', 'aria-expanded', 'aria-controls',
-        'data-*',  // DOMPurify 默认即放行 data-* (ALLOW_DATA_ATTR=true)，列在这里更醒目
-        // SVG 常用
-        'viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'd', 'cx', 'cy', 'r', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'points', 'transform', 'preserveAspectRatio', 'opacity', 'fill-opacity', 'stroke-opacity', 'fill-rule', 'stroke-linecap', 'stroke-linejoin',
+        // SVG 常用几何/样式
+        'viewBox', 'fill', 'stroke', 'stroke-width', 'd', 'cx', 'cy', 'r', 'x', 'y', 'x1', 'y1', 'x2', 'y2',
+        'points', 'transform', 'preserveAspectRatio', 'opacity', 'fill-opacity', 'stroke-opacity',
+        'fill-rule', 'stroke-linecap', 'stroke-linejoin',
         'width', 'height',
+        // data-* 由 DOMPurify 默认 ALLOW_DATA_ATTR=true 放行，无需列出
     ]),
     ALLOWED_URI_REGEXP: _DP_SAFE_CFG.ALLOWED_URI_REGEXP,
     // 关键 XSS 载体仍 FORBID；只把 'style' 从黑名单中拿掉
@@ -1959,13 +1970,45 @@ const _DP_PERMISSIVE_CFG = {
     FORBID_ATTR: _DP_SAFE_CFG.FORBID_ATTR,
 };
 
+// v0.5.17-regex.7 P0 修复：<style> 内容硬化 hook
+// DOMPurify 不解析 CSS 文本，所以 <style>@import url(http://attacker)</style> 这类外带攻击会原样保留。
+// 此 hook 在元素入站时就地清理：删除 @import、expression()，并把 url() 收紧到 https / data:image 子集。
+function _hardenStyleHook(node, data) {
+    if (!data || data.tagName !== 'style') return;
+    const css = node.textContent || '';
+    if (!css) return;
+    let out = css;
+    // 1) @import 一律删除（避免外部 CSS 跨源加载 + 信息探测）
+    out = out.replace(/@import\b[^;]*;?/gi, '');
+    // 2) expression(...)（IE 时代 CSS XSS）
+    out = out.replace(/expression\s*\(/gi, 'x_blocked_(');
+    // 3) javascript:/vbscript: URI 协议
+    out = out.replace(/(?:javascript|vbscript)\s*:/gi, 'x-blocked:');
+    // 4) url(...) 只允许 https / data:image 子集；其余清空（包括 http、相对路径，避免外带探测）
+    out = out.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (_m, q, u) => {
+        const t = String(u).trim();
+        return /^(?:https:\/\/|data:image\/(?:png|jpeg|gif|webp|svg\+xml))/i.test(t)
+            ? `url(${q}${t}${q})`
+            : 'url()';
+    });
+    if (out !== css) node.textContent = out;
+}
+
 function sanitizeMd(html, mode) {
     if (!html) return '';
     const DP = (typeof window !== 'undefined') ? window.DOMPurify : null;
     if (DP && typeof DP.sanitize === 'function') {
         try {
-            const cfg = (mode === 'permissive') ? _DP_PERMISSIVE_CFG : _DP_SAFE_CFG;
-            return DP.sanitize(html, cfg);
+            if (mode === 'permissive') {
+                // permissive 路径：临时挂 <style> 硬化 hook，sanitize 后立刻摘掉，避免污染外部 DP 状态
+                DP.addHook('uponSanitizeElement', _hardenStyleHook);
+                try {
+                    return DP.sanitize(html, _DP_PERMISSIVE_CFG);
+                } finally {
+                    DP.removeHook('uponSanitizeElement');
+                }
+            }
+            return DP.sanitize(html, _DP_SAFE_CFG);
         } catch (e) {
             console.warn('[ChatVault] DOMPurify.sanitize 抛错，按 fail-closed 退化为字面文本：', e);
         }
