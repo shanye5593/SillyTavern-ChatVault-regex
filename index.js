@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.3';
+const VERSION = '0.5.17-regex.4';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -112,6 +112,15 @@ function loadSettings() {
         // 只把"明确 false"和"明确字符串 'false' / 数字 0"视作关；其它一律按默认 true
         const _falsey = (v) => v === false || v === 'false' || v === 0 || v === '0';
         s.readerRichRender = !_falsey(s.readerRichRender);
+        // v0.5.17-regex.4 修复浅合并陷阱：旧 settings 若已写入残缺的 regexEnabled 会覆盖默认空对象
+        // 必须深合并到 {global, byChar} 形态，否则 buildActiveTavernRules / isRegexEnabledInCv 取嵌套属性会 NPE
+        const _re = s.regexEnabled && typeof s.regexEnabled === 'object' ? s.regexEnabled : {};
+        s.regexEnabled = {
+            global: (_re.global && typeof _re.global === 'object') ? _re.global : {},
+            byChar: (_re.byChar && typeof _re.byChar === 'object') ? _re.byChar : {},
+        };
+        if (!Array.isArray(s.regexSyncedAvatars)) s.regexSyncedAvatars = [];
+        s.regexEngineEnabled = s.regexEngineEnabled === true;   // 严格只接受 true，其它一律 false
         return s;
     } catch {
         return { ...DEFAULT_SETTINGS };
@@ -1592,13 +1601,20 @@ function parseTavernFindRegex(src) {
 
 // 把 ST 风格 macro 转成 JS replace 语法（最小可用集）
 // {{match}} → $&   {{user}}/{{char}} → 仅做静态字面替换（如能拿到）
+// 注意：ctx.user / ctx.char 若含 $1 $& 等会被 JS replace 误识别为反向引用 → 必须用函数式回调避开
 function transformReplaceMacros(replace, ctx) {
     if (!replace) return '';
     let out = String(replace);
     out = out.replace(/\{\{\s*match\s*\}\}/gi, '$&');
     if (ctx) {
-        if (ctx.user != null) out = out.replace(/\{\{\s*user\s*\}\}/gi, ctx.user);
-        if (ctx.char != null) out = out.replace(/\{\{\s*char\s*\}\}/gi, ctx.char);
+        if (ctx.user != null) {
+            const u = String(ctx.user);
+            out = out.replace(/\{\{\s*user\s*\}\}/gi, () => u);
+        }
+        if (ctx.char != null) {
+            const c = String(ctx.char);
+            out = out.replace(/\{\{\s*char\s*\}\}/gi, () => c);
+        }
     }
     return out;
 }
