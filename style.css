@@ -2268,3 +2268,11 @@
 .cv-regex-copy { background: none; border: 1px solid var(--cv-border, rgba(127,127,127,0.3)); border-radius: 4px; cursor: pointer; font-size: 0.78em; padding: 1px 8px; opacity: 0.75; }
 .cv-regex-copy:hover { opacity: 1; }
 .cv-regex-code { margin: 0; padding: 6px 8px; max-height: 240px; overflow: auto; background: rgba(0,0,0,0.18); color: inherit; border-radius: 4px; font-size: 0.78em; font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace; line-height: 1.45; white-space: pre-wrap; word-break: break-all; }
+
+/* v0.5.17-regex.1 角色 picker 列表 */
+.cv-regex-char-picker { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow: auto; border: 1px solid var(--cv-border, rgba(127,127,127,0.2)); border-radius: 6px; padding: 4px; }
+.cv-regex-char-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 4px; cursor: pointer; transition: background 0.1s; }
+.cv-regex-char-row:hover { background: rgba(127,127,127,0.1); }
+.cv-regex-char-row.cv-regex-loading { opacity: 0.6; pointer-events: none; }
+.cv-regex-char-cb { margin: 0; flex-shrink: 0; }
+.cv-regex-char-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }

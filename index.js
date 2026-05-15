@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.0';
+const VERSION = '0.5.17-regex.1';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -81,6 +81,8 @@ const DEFAULT_SETTINGS = {
     // v0.5.14 阅读模式增强渲染开关（表格/代码块/列表/引用/AI 内联 HTML 如 <img> <p style>）
     // 默认 ON；如果遇到大图/超长表格卡顿，可关掉退回极简模式（仅识别 *斜* **粗**）
     readerRichRender: true,
+    // v0.5.17-regex 已勾选同步正则的角色卡 avatar 列表（懒加载，只在勾选时拉取）
+    regexSyncedAvatars: [],
 };
 
 function loadSettings() {
@@ -1384,16 +1386,17 @@ function scanRegexDangers(replaceStr) {
     return hits;
 }
 
-// 从酒馆运行时读全部正则：全局 + 每个角色卡的角色正则
-// 返回 { global: [...], byChar: [{name, avatar, scripts:[...]}, ...], errors: [...] }
-function getTavernRegexes() {
-    const out = { global: [], byChar: [], errors: [] };
+// 内存级缓存：avatar -> { name, scripts: [...], fetchedAt: timestamp, error?: string }
+// 仅本次会话有效；用户勾选/重扫时填充；不持久化（持久化的只是"勾了哪些卡"）
+const _charRegexCache = new Map();
+
+function getGlobalRegexes() {
+    const out = { global: [], errors: [] };
     let ctx;
     try { ctx = SillyTavern.getContext(); } catch (e) {
         out.errors.push('无法获取酒馆上下文：' + e.message);
         return out;
     }
-    // 全局正则
     try {
         const ext = ctx.extensionSettings || (typeof extension_settings !== 'undefined' ? extension_settings : null);
         const arr = ext && Array.isArray(ext.regex) ? ext.regex : [];
@@ -1401,22 +1404,50 @@ function getTavernRegexes() {
     } catch (e) {
         out.errors.push('读取全局正则失败：' + e.message);
     }
-    // 角色正则
-    try {
-        const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
-        for (const c of chars) {
-            const scripts = c?.data?.extensions?.regex_scripts;
-            if (!Array.isArray(scripts) || scripts.length === 0) continue;
-            out.byChar.push({
-                name: c.name || '(未命名)',
-                avatar: c.avatar || '',
-                scripts: scripts.map(r => normalizeRegexScript(r, '角色: ' + (c.name || '?'))),
-            });
-        }
-    } catch (e) {
-        out.errors.push('读取角色正则失败：' + e.message);
-    }
     return out;
+}
+
+// 列出所有角色卡的基本信息（仅 name + avatar，无需 extension 数据）
+function listAllCharacterCards() {
+    try {
+        const ctx = SillyTavern.getContext();
+        const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+        const seen = new Set();
+        return chars
+            .filter(c => c && c.avatar && !seen.has(c.avatar) && (seen.add(c.avatar), true))
+            .map(c => ({ name: c.name || '(未命名)', avatar: c.avatar }))
+            .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+    } catch { return []; }
+}
+
+// 拉取单张角色卡的完整数据，提取 regex_scripts 写入缓存
+async function fetchCharacterRegexInto(avatar, name) {
+    try {
+        const res = await fetch('/api/characters/get', {
+            method: 'POST',
+            headers: headers(),
+            body: JSON.stringify({ avatar_url: avatar }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const card = await res.json();
+        const scripts = card?.data?.extensions?.regex_scripts;
+        const arr = Array.isArray(scripts) ? scripts : [];
+        const cardName = card?.name || name || '(未命名)';
+        _charRegexCache.set(avatar, {
+            name: cardName,
+            scripts: arr.map(r => normalizeRegexScript(r, '角色: ' + cardName)),
+            fetchedAt: Date.now(),
+        });
+        return _charRegexCache.get(avatar);
+    } catch (e) {
+        _charRegexCache.set(avatar, {
+            name: name || '(未命名)',
+            scripts: [],
+            fetchedAt: Date.now(),
+            error: e.message || String(e),
+        });
+        return _charRegexCache.get(avatar);
+    }
 }
 
 // 渲染单条正则的卡片 HTML（折叠卡片，标题行 + 展开后的 find/replace/trim/属性）
@@ -3765,7 +3796,7 @@ function injectSettings() {
           </div>
           <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
 
-          <!-- 酒馆正则只读列表（v0.5.17-regex.0 实验功能；只展示，不接渲染） -->
+          <!-- 酒馆正则只读列表（v0.5.17-regex.1 实验功能；只展示，不接渲染） -->
           <div class="inline-drawer cv-sub-drawer" id="cv_regex_drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
               <b>🧪 酒馆正则列表（实验/只读）</b>
@@ -3773,15 +3804,48 @@ function injectSettings() {
             </div>
             <div class="inline-drawer-content">
               <div class="cv-settings-hint" style="margin-bottom:8px;">
-                ⚠️ <b>实验功能</b>：当前仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入、不会影响阅读模式渲染。<br>
-                所有数据从酒馆运行时读取（全局正则 + 每张角色卡上的角色正则），ChatVault 不做本地拷贝。<br>
+                ⚠️ <b>实验功能</b>：仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入、不会影响阅读模式渲染。<br>
                 ⚙️ 要新增/编辑/删除正则，请到酒馆原生「正则」扩展面板操作。
               </div>
-              <div class="cv-settings-row">
-                <button id="cv_regex_refresh" class="menu_button cv-inline-btn">🔄 重新扫描</button>
-                <span id="cv_regex_summary" class="cv-settings-hint" style="margin-left:8px;"></span>
+
+              <!-- 子折叠 1：全局正则 -->
+              <div class="inline-drawer cv-sub-drawer" id="cv_regex_global_drawer" style="margin-top:8px;">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                  <b>🌐 全局正则 <span id="cv_regex_global_count" class="cv-regex-count">…</span></b>
+                  <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                  <div class="cv-settings-row">
+                    <button id="cv_regex_global_refresh" class="menu_button cv-inline-btn">🔄 重新扫描全局</button>
+                    <span id="cv_regex_global_summary" class="cv-settings-hint" style="margin-left:8px;"></span>
+                  </div>
+                  <div id="cv_regex_global_list" class="cv-regex-list" style="margin-top:8px;"></div>
+                </div>
               </div>
-              <div id="cv_regex_list" class="cv-regex-list" style="margin-top:8px;"></div>
+
+              <!-- 子折叠 2：角色卡正则同步 -->
+              <div class="inline-drawer cv-sub-drawer" id="cv_regex_char_drawer" style="margin-top:8px;">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                  <b>🎭 角色卡正则同步 <span id="cv_regex_char_count" class="cv-regex-count">…</span></b>
+                  <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                  <div class="cv-settings-hint" style="margin-bottom:8px;">
+                    💡 酒馆按需加载角色卡数据，<b>没勾选的卡完全不读取</b>，不占加载时间。<br>
+                    勾选立即拉取该卡的正则；取消勾选立即从下方列表移除。
+                  </div>
+                  <div class="cv-settings-row" style="gap:6px; flex-wrap:wrap;">
+                    <input type="text" id="cv_regex_char_filter" class="text_pole" placeholder="搜索角色名…" style="flex:1; min-width:160px;">
+                    <button id="cv_regex_char_rescan" class="menu_button cv-inline-btn" title="重新拉取所有已勾选角色的正则">🔄 重扫已勾选</button>
+                  </div>
+                  <div id="cv_regex_char_picker" class="cv-regex-char-picker" style="margin-top:8px;"></div>
+                  <hr style="border:none; border-top:1px dashed var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
+                  <div class="cv-settings-hint" style="opacity:0.85;">
+                    📜 已勾选角色的正则：
+                  </div>
+                  <div id="cv_regex_char_list" class="cv-regex-list" style="margin-top:6px;"></div>
+                </div>
+              </div>
             </div>
           </div>
           <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
@@ -3878,46 +3942,115 @@ function injectSettings() {
             try { renderReader(); } catch {}
         }
     });
-    // ----- 酒馆正则只读列表 -----
-    const regexListEl = wrap.querySelector('#cv_regex_list');
-    const regexSummaryEl = wrap.querySelector('#cv_regex_summary');
-    const renderRegexList = () => {
-        const data = getTavernRegexes();
-        const totalGlobal = data.global.length;
-        const totalCharScripts = data.byChar.reduce((n, c) => n + c.scripts.length, 0);
-        const totalChars = data.byChar.length;
-        const dangerCount = [
-            ...data.global,
-            ...data.byChar.flatMap(c => c.scripts),
-        ].filter(s => s.dangers.length > 0).length;
-        regexSummaryEl.innerHTML =
-            `共 <b>${totalGlobal}</b> 条全局 · <b>${totalCharScripts}</b> 条角色正则（来自 ${totalChars} 张角色卡）` +
-            (dangerCount ? ` · <span style="color:#e15555;">⚠ ${dangerCount} 条含危险代码</span>` : '');
-        const groups = [];
-        if (data.global.length) groups.push({ title: '🌐 全局正则', items: data.global, anchor: 'global' });
-        for (const c of data.byChar) {
-            groups.push({ title: '🎭 ' + c.name, items: c.scripts, anchor: c.avatar || c.name });
-        }
-        if (groups.length === 0) {
-            regexListEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">酒馆里没有任何正则脚本（全局和角色卡都为空）。</div>`;
+    // ----- 酒馆正则只读列表 v0.5.17-regex.1 -----
+    const globalListEl    = wrap.querySelector('#cv_regex_global_list');
+    const globalCountEl   = wrap.querySelector('#cv_regex_global_count');
+    const globalSummaryEl = wrap.querySelector('#cv_regex_global_summary');
+    const charPickerEl    = wrap.querySelector('#cv_regex_char_picker');
+    const charListEl      = wrap.querySelector('#cv_regex_char_list');
+    const charCountEl     = wrap.querySelector('#cv_regex_char_count');
+    const charFilterEl    = wrap.querySelector('#cv_regex_char_filter');
+
+    const _danger = items => items.filter(s => s.dangers.length > 0).length;
+
+    const renderGlobal = () => {
+        const data = getGlobalRegexes();
+        const dCount = _danger(data.global);
+        globalCountEl.textContent = String(data.global.length);
+        globalSummaryEl.innerHTML = `共 <b>${data.global.length}</b> 条`
+            + (dCount ? ` · <span style="color:#e15555;">⚠ ${dCount} 条含危险代码</span>` : '');
+        if (data.global.length === 0) {
+            globalListEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">酒馆里没有全局正则。</div>`;
         } else {
-            regexListEl.innerHTML = groups.map(g => `
-                <div class="cv-regex-group">
-                    <div class="cv-regex-group-head">${escapeHtml(g.title)} <span class="cv-regex-count">${g.items.length}</span></div>
-                    ${g.items.map((it, idx) => renderRegexItemHtml(it, g.anchor + '-' + idx)).join('')}
-                </div>
-            `).join('');
+            globalListEl.innerHTML = data.global
+                .map((it, idx) => renderRegexItemHtml(it, 'g-' + idx))
+                .join('');
         }
         if (data.errors.length) {
             const err = document.createElement('div');
             err.className = 'cv-settings-hint';
             err.style.cssText = 'color:#e15555; margin-top:8px;';
             err.textContent = '读取错误：' + data.errors.join('; ');
-            regexListEl.appendChild(err);
+            globalListEl.appendChild(err);
         }
     };
-    // 折叠展开 / 复制按钮事件委托
-    regexListEl.addEventListener('click', (e) => {
+
+    // 渲染角色卡 picker（复选框列表）
+    const renderCharPicker = () => {
+        const cur = loadSettings();
+        const synced = new Set(Array.isArray(cur.regexSyncedAvatars) ? cur.regexSyncedAvatars : []);
+        const all = listAllCharacterCards();
+        const filter = (charFilterEl.value || '').trim().toLowerCase();
+        const shown = filter ? all.filter(c => c.name.toLowerCase().includes(filter)) : all;
+        charCountEl.textContent = `已勾选 ${synced.size} / 共 ${all.length}`;
+        if (all.length === 0) {
+            charPickerEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">酒馆里没有角色卡。</div>`;
+            return;
+        }
+        if (shown.length === 0) {
+            charPickerEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">没有匹配「${escapeHtml(filter)}」的角色。</div>`;
+            return;
+        }
+        charPickerEl.innerHTML = shown.map(c => {
+            const checked = synced.has(c.avatar);
+            const cached = _charRegexCache.get(c.avatar);
+            let badge = '';
+            if (checked) {
+                if (!cached) badge = `<span class="cv-regex-meta">未拉取</span>`;
+                else if (cached.error) badge = `<span class="cv-regex-danger" title="${escapeHtml(cached.error)}">⚠ 拉取失败</span>`;
+                else if (cached.scripts.length === 0) badge = `<span class="cv-regex-meta">无正则</span>`;
+                else {
+                    const dCount = _danger(cached.scripts);
+                    badge = `<span class="cv-regex-meta">${cached.scripts.length} 条</span>`
+                        + (dCount ? `<span class="cv-regex-danger">⚠ ${dCount}</span>` : '');
+                }
+            }
+            return `
+              <label class="cv-regex-char-row" data-avatar="${escapeHtml(c.avatar)}">
+                <input type="checkbox" class="cv-regex-char-cb" ${checked ? 'checked' : ''}>
+                <span class="cv-regex-char-name">${escapeHtml(c.name)}</span>
+                ${badge}
+              </label>
+            `;
+        }).join('');
+    };
+
+    // 渲染已勾选角色的正则列表
+    const renderCharRegexList = () => {
+        const cur = loadSettings();
+        const synced = Array.isArray(cur.regexSyncedAvatars) ? cur.regexSyncedAvatars : [];
+        const groups = [];
+        for (const av of synced) {
+            const cached = _charRegexCache.get(av);
+            if (!cached) continue;
+            groups.push({ avatar: av, name: cached.name, scripts: cached.scripts, error: cached.error });
+        }
+        if (groups.length === 0) {
+            charListEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">还没勾选任何角色卡，或勾选的角色卡尚未拉取完成。</div>`;
+            return;
+        }
+        charListEl.innerHTML = groups.map((g, gi) => {
+            if (g.error) {
+                return `<div class="cv-regex-group">
+                  <div class="cv-regex-group-head">🎭 ${escapeHtml(g.name)} <span class="cv-regex-danger">⚠ 拉取失败</span></div>
+                  <div class="cv-settings-hint" style="color:#e15555; padding:4px;">${escapeHtml(g.error)}</div>
+                </div>`;
+            }
+            if (g.scripts.length === 0) {
+                return `<div class="cv-regex-group">
+                  <div class="cv-regex-group-head">🎭 ${escapeHtml(g.name)} <span class="cv-regex-count">0</span></div>
+                  <div class="cv-settings-hint" style="opacity:0.7; padding:4px;">该角色卡没有绑定正则。</div>
+                </div>`;
+            }
+            return `<div class="cv-regex-group">
+              <div class="cv-regex-group-head">🎭 ${escapeHtml(g.name)} <span class="cv-regex-count">${g.scripts.length}</span></div>
+              ${g.scripts.map((it, i) => renderRegexItemHtml(it, `c${gi}-${i}`)).join('')}
+            </div>`;
+        }).join('');
+    };
+
+    // 折叠 / 复制 事件委托（共用全局列表 + 角色列表）
+    const regexCardEvtHandler = (e) => {
         const tog = e.target.closest('.cv-regex-toggle');
         if (tog) {
             e.preventDefault();
@@ -3935,19 +4068,93 @@ function injectSettings() {
                 setTimeout(() => { cp.textContent = '📋 复制'; }, 1200);
             } catch { /* ignore */ }
         }
-    });
-    wrap.querySelector('#cv_regex_refresh').addEventListener('click', (e) => {
+    };
+    globalListEl.addEventListener('click', regexCardEvtHandler);
+    charListEl.addEventListener('click', regexCardEvtHandler);
+
+    // 全局重扫
+    wrap.querySelector('#cv_regex_global_refresh').addEventListener('click', (e) => {
         e.preventDefault();
-        renderRegexList();
+        renderGlobal();
     });
-    // 折叠区首次展开时再渲染（避免影响设置面板初次打开速度）
+
+    // 角色搜索
+    let _filterDebounce;
+    charFilterEl.addEventListener('input', () => {
+        clearTimeout(_filterDebounce);
+        _filterDebounce = setTimeout(renderCharPicker, 120);
+    });
+
+    // 勾选 / 取消勾选
+    charPickerEl.addEventListener('change', async (e) => {
+        const cb = e.target.closest('.cv-regex-char-cb');
+        if (!cb) return;
+        const row = cb.closest('.cv-regex-char-row');
+        const avatar = row?.dataset?.avatar;
+        if (!avatar) return;
+        const cur = loadSettings();
+        const synced = new Set(Array.isArray(cur.regexSyncedAvatars) ? cur.regexSyncedAvatars : []);
+        const name = row.querySelector('.cv-regex-char-name')?.textContent || '';
+        if (cb.checked) {
+            synced.add(avatar);
+            saveSettings({ ...cur, regexSyncedAvatars: [...synced] });
+            // 立即拉取（如果没缓存）
+            if (!_charRegexCache.has(avatar)) {
+                row.classList.add('cv-regex-loading');
+                await fetchCharacterRegexInto(avatar, name);
+                row.classList.remove('cv-regex-loading');
+            }
+            renderCharPicker();
+            renderCharRegexList();
+        } else {
+            synced.delete(avatar);
+            saveSettings({ ...cur, regexSyncedAvatars: [...synced] });
+            renderCharPicker();
+            renderCharRegexList();
+        }
+    });
+
+    // 重扫已勾选
+    wrap.querySelector('#cv_regex_char_rescan').addEventListener('click', async (e) => {
+        e.preventDefault();
+        const cur = loadSettings();
+        const synced = Array.isArray(cur.regexSyncedAvatars) ? cur.regexSyncedAvatars : [];
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        const oldText = btn.textContent;
+        try {
+            for (let i = 0; i < synced.length; i++) {
+                const av = synced[i];
+                btn.textContent = `🔄 拉取中 ${i + 1}/${synced.length}`;
+                await fetchCharacterRegexInto(av);
+            }
+            renderCharPicker();
+            renderCharRegexList();
+        } finally {
+            btn.disabled = false;
+            btn.textContent = oldText;
+        }
+    });
+
+    // 主折叠区首次展开时初始化（懒加载已勾选角色）
     const regexDrawer = wrap.querySelector('#cv_regex_drawer');
-    let _regexRendered = false;
+    let _regexInited = false;
     regexDrawer.querySelector('.inline-drawer-toggle').addEventListener('click', () => {
-        if (_regexRendered) return;
-        _regexRendered = true;
-        // 等折叠动画起步后再渲染，避免阻塞
-        setTimeout(() => renderRegexList(), 0);
+        if (_regexInited) return;
+        _regexInited = true;
+        setTimeout(async () => {
+            renderGlobal();
+            renderCharPicker();
+            // 自动拉取已勾选角色（用户上次保存的）
+            const cur = loadSettings();
+            const synced = Array.isArray(cur.regexSyncedAvatars) ? cur.regexSyncedAvatars : [];
+            const todo = synced.filter(av => !_charRegexCache.has(av));
+            if (todo.length > 0) {
+                for (const av of todo) await fetchCharacterRegexInto(av);
+                renderCharPicker();
+            }
+            renderCharRegexList();
+        }, 0);
     });
 
     wrap.querySelector('#cv_set_theme').addEventListener('change', (e) => {
