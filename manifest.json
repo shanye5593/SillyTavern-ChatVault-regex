@@ -1,0 +1,14 @@
+{
+    "display_name": "聊天档案 (ChatVault) - 正则测试版",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "shanye5593",
+    "version": "0.5.16-regex.0",
+    "homePage": "https://github.com/shanye5593/SillyTavern-ChatVault-regex",
+    "auto_update": true,
+    "minimum_client_version": "1.12.0"
+}
