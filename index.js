@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.12';
+const VERSION = '0.5.17-regex.13';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -2035,6 +2035,33 @@ function _extractHtmlDoc(s) {
     };
 }
 
+// v0.5.17-regex.13：清理酒馆助手卡 HTML 文档前后残留的 wrapper 噪声
+// 用户实测：状态栏 iframe 前后出现"浅灰圆角空白条带 | 光标"——根因是原文形如
+//   <hl_status_widget_v2>|\n<!DOCTYPE><html>...</html>\n|</hl_status_widget_v2>
+// 酒馆正则只替换内部，外面剩下 wrapper 闭合标签 + 孤立 | 字符，markdown 把孤立 | 当成
+// 空 table 渲染出浅灰圆角条 + 字面 | 字符。
+//
+// 此函数：
+//  - 移除常见 AI/酒馆助手 wrapper 标签（content/thinking/response/status/hidden/placeholder/output 等）
+//  - 移除孤立成行的 markdown table 分隔符 |
+//  - trim 首尾空白
+//  - 若剩余字符 < 3 视为纯噪声，返回空串（cardHtml 不渲染该段）
+function _stripIframeWrapNoise(s) {
+    if (!s || typeof s !== 'string') return '';
+    let t = s;
+    // 常见 wrapper 标签（开闭都去），不影响标准 markdown
+    t = t.replace(/<\/?(?:content|thinking|response|status|hidden|placeholder|output|hl_status_widget_v[\w]*)\b[^>]*>/gi, '');
+    // 孤立成行的 |（markdown table 噪声）
+    t = t.replace(/^[ \t]*\|[ \t]*$/gm, '');
+    // 收敛多余空行
+    t = t.replace(/\n{3,}/g, '\n\n');
+    t = t.trim();
+    // 剩余字符过少视为纯噪声（去掉所有空白和常见标点后判断）
+    const stripped = t.replace(/[\s\t\r\n|`~\-_*<>\/=]+/g, '');
+    if (stripped.length < 3) return '';
+    return t;
+}
+
 // HTML 属性值 escape（仅用于 srcdoc=""）
 function _escapeAttr(s) {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
@@ -2304,8 +2331,9 @@ function renderReader() {
                 const ext = _extractHtmlDoc(raw);
                 if (ext) {
                     iframeSrc = ext.doc;
-                    iframeBefore = ext.before;
-                    iframeAfter = ext.after;
+                    // v0.5.17-regex.13：清理 wrapper 噪声（孤立 | / <content> / </hl_status_widget_v2> 等）
+                    iframeBefore = _stripIframeWrapNoise(ext.before);
+                    iframeAfter = _stripIframeWrapNoise(ext.after);
                 }
             }
             // 第 2 步：ChatVault strip/extract（与正式版一致）
