@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.9';
+const VERSION = '0.5.17-regex.10';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -2014,8 +2014,25 @@ function _hardenStyleHook(node, data) {
 //    → iframe 视为 null origin，不能读 parent.cookie / parent.document（DOM 隔离）
 //  - 高度自适应通过 postMessage 通信，父侧 listener 校验消息结构 + clamp 高度上限
 
-function _isFullHtmlDoc(s) {
-    return typeof s === 'string' && /^\s*<(?:!doctype\s+html|html\b)/i.test(s);
+// v0.5.17-regex.10：从文本中"提取"完整 HTML 文档段（不再要求字符串开头）
+// 用户的酒馆正则常把 <hl_status_widget_v2> 这类标签替换成 <!DOCTYPE html><html>...</html>，
+// 结果是 "前文文字 <!DOCTYPE><html>...</html> 后文文字" 的混合形态。
+// 之前 v0.5.17-regex.9 的 ^doctype 判定只看开头，永远不命中 → iframe 路径失效 →
+// 走 fragment 路径，<!DOCTYPE 不匹配 renderRichMd 的 ^<[a-zA-Z] 直通规则被 escape → 用户看到裸代码。
+//
+// 此函数找出文本中第一段完整 HTML 文档，返回 { before, doc, after } 三段；找不到返回 null。
+// 仅匹配 <!DOCTYPE...><html>...</html> 或裸 <html>...</html>，闭合标签必须对齐。
+function _extractHtmlDoc(s) {
+    if (!s || typeof s !== 'string') return null;
+    // 优先匹配带 DOCTYPE 的完整文档；其次裸 <html>...</html>
+    let m = s.match(/<!doctype\s+html[^>]*>\s*<html\b[\s\S]*?<\/html\s*>/i);
+    if (!m) m = s.match(/<html\b[^>]*>[\s\S]*?<\/html\s*>/i);
+    if (!m) return null;
+    return {
+        before: s.slice(0, m.index),
+        doc: m[0],
+        after: s.slice(m.index + m[0].length),
+    };
 }
 
 // HTML 属性值 escape（仅用于 srcdoc=""）
@@ -2256,20 +2273,34 @@ function renderReader() {
             if (_tavRules && raw) {
                 try { raw = applyTavernRules(raw, isUser, _tavRules); } catch { /* keep raw */ }
             }
-            // v0.5.17-regex.9：若结果是整段 HTML 文档（<!DOCTYPE>/<html>），改走 sandbox iframe 路径
-            // 这是酒馆助手风格的状态栏卡 —— DOMPurify 白名单永远渲染不出来，只能 iframe 隔离
-            // 仅在总开关开（_tavRules 非 null）时启用；关时该字段始终 null，行为退回正式版
-            let iframeSrc = null;
-            if (_tavRules && _isFullHtmlDoc(raw)) {
-                iframeSrc = raw;
-                // text 仍保留原文，作为 iframe 加载失败时的降级显示（escape 后纯文本）
+            // v0.5.17-regex.10：从结果中"提取"完整 HTML 文档段（任意位置）→ 走 sandbox iframe 路径
+            // 酒馆正则的 replace 经常把内嵌标签替换成完整 HTML 文档，前后还有对话文本。
+            // 把 HTML 段抽出来塞 iframe，前后文本按原管线（strip/extract → richMd → DOMPurify）渲染。
+            // 仅在总开关开（_tavRules 非 null）时启用；关时三个字段全 null，行为退回正式版。
+            let iframeSrc = null, iframeBefore = '', iframeAfter = '';
+            if (_tavRules && raw) {
+                const ext = _extractHtmlDoc(raw);
+                if (ext) {
+                    iframeSrc = ext.doc;
+                    iframeBefore = ext.before;
+                    iframeAfter = ext.after;
+                }
             }
             // 第 2 步：ChatVault strip/extract（与正式版一致）
-            const text = raw ? processMessageText(raw, s, e) : '';
+            // iframe 模式下：仅对前后文本 process（HTML 段不能被 strip 当文本删，否则 iframe 内容被破坏）
+            // 普通模式下：对整段 raw process
+            let text;
+            if (iframeSrc) {
+                const beforeT = iframeBefore ? processMessageText(iframeBefore, s, e) : '';
+                const afterT = iframeAfter ? processMessageText(iframeAfter, s, e) : '';
+                text = (beforeT || '') + (afterT ? (beforeT ? '\n' : '') + afterT : '');
+            } else {
+                text = raw ? processMessageText(raw, s, e) : '';
+            }
             // user 名字优先用消息自身记录的 m.name（兼容多 persona 聊天），否则用文件级 userName
             const rawName = m?.name && m.name !== 'unused' ? m.name : '';
             const who = isUser ? (rawName || userName) : (rawName || charName);
-            return { idx, who, is_user: isUser, text, iframeSrc };
+            return { idx, who, is_user: isUser, text, iframeSrc, iframeBefore, iframeAfter };
         });
     }
     const processed = readerState._processed;
@@ -2303,19 +2334,29 @@ function renderReader() {
 
     const cardHtml = slice.map(m => {
         const who = escapeHtml(m.who);
-        // v0.5.17-regex.9：iframe 模式（酒馆助手风格的完整 HTML 文档卡）
-        // 用 sandbox iframe + srcdoc 隔离渲染，不经 DOMPurify（浏览器原生 sandbox 已是最强隔离）
+        // v0.5.17-regex.10：iframe 模式（酒馆助手风格的完整 HTML 文档卡）
+        // 三段拼接：[前文文本(走 sanitizeMd)] + [HTML 段(走 sandbox iframe)] + [后文文本(走 sanitizeMd)]
         let text;
         if (m.iframeSrc) {
-            // 每条消息独立 id，便于父侧 postMessage 路由高度
             const ifrId = `cv-ifr-${readerState.character?.avatar || 'x'}-${m.idx}`;
             const wrapped = _wrapDocWithResizer(m.iframeSrc, ifrId);
             // sandbox="allow-scripts" → JS 能跑（状态栏交互可工作），但视为 null origin（DOM 隔离 / 不能读 cookie）
-            // 故意 NOT 加 allow-same-origin / allow-top-navigation / allow-forms / allow-popups
-            text = `<iframe class="cv-msg-iframe" data-cv-iframe-id="${_escapeAttr(ifrId)}" `
+            const ifrTag = `<iframe class="cv-msg-iframe" data-cv-iframe-id="${_escapeAttr(ifrId)}" `
                  + `sandbox="allow-scripts" loading="lazy" referrerpolicy="no-referrer" `
                  + `style="width:100%;border:0;background:transparent;min-height:120px;display:block;" `
                  + `srcdoc="${_escapeAttr(wrapped)}"></iframe>`;
+            // 前后文本走原管线（已 strip/extract，再 markdown + sanitize）
+            const beforeT = (m.iframeBefore || '').trim();
+            const afterT = (m.iframeAfter || '').trim();
+            const beforeProcessed = beforeT ? processMessageText(beforeT, _readerCfg.strip, _readerCfg.extract) : '';
+            const afterProcessed = afterT ? processMessageText(afterT, _readerCfg.strip, _readerCfg.extract) : '';
+            const beforeHtml = beforeProcessed
+                ? (_useRichRender ? sanitizeMd(renderRichMd(beforeProcessed), _sanitizeMode) : renderLiteMd(beforeProcessed))
+                : '';
+            const afterHtml = afterProcessed
+                ? (_useRichRender ? sanitizeMd(renderRichMd(afterProcessed), _sanitizeMode) : renderLiteMd(afterProcessed))
+                : '';
+            text = beforeHtml + ifrTag + afterHtml;
         } else {
             // m.text 已经过【酒馆正则 → strip → extract】处理（v0.5.17-regex.5 起在 _processed 缓存层完成）
             text = m.text
