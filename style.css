@@ -2282,3 +2282,8 @@
 .cv-regex-cv-toggle input { margin: 0; }
 .cv-regex-cv-on { border-color: rgba(80,180,120,0.55); background: rgba(80,180,120,0.06); }
 .cv-regex-cv-on .cv-regex-cv-toggle { background: rgba(80,180,120,0.22); color: #4caf6a; font-weight: 600; }
+
+/* v0.5.17-regex.3 总开关样式 */
+.cv-regex-master { padding: 8px 10px; border-radius: 6px; border: 1px solid var(--cv-border, rgba(127,127,127,0.25)); background: rgba(127,127,127,0.04); }
+.cv-regex-master-on { border-color: rgba(220,160,60,0.7); background: rgba(220,160,60,0.10); }
+.cv-regex-master-on label > span { color: #d68a2c; }

@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.2';
+const VERSION = '0.5.17-regex.3';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -86,6 +86,9 @@ const DEFAULT_SETTINGS = {
     // v0.5.17-regex.2 每条正则在 ChatVault 中是否启用（仅记录，未接渲染管线）
     // 形如 { global: { '<regex.id>': true, ... }, byChar: { '<avatar>': { '<regex.id>': true } } }
     regexEnabled: { global: {}, byChar: {} },
+    // v0.5.17-regex.3 总开关：是否真正在阅读模式应用酒馆正则
+    // 默认 false → 渲染管线完全旁路，行为与正式版字节级一致；零开销
+    regexEngineEnabled: false,
 };
 
 function loadSettings() {
@@ -1550,9 +1553,9 @@ function renderRegexItemHtml(it, key, scope) {
 }
 
 function normalizeRegexScript(r, scopeLabel) {
-    const placements = Array.isArray(r?.placement) ? r.placement : [];
+    const placements = Array.isArray(r?.placement) ? r.placement.map(Number).filter(n => Number.isFinite(n)) : [];
     const placementLabels = placements
-        .map(n => TAV_REGEX_PLACEMENT_LABELS[Number(n)] || ('?' + n))
+        .map(n => TAV_REGEX_PLACEMENT_LABELS[n] || ('?' + n))
         .filter(Boolean);
     const replaceStr = String(r?.replaceString || '');
     return {
@@ -1562,7 +1565,8 @@ function normalizeRegexScript(r, scopeLabel) {
         replace: replaceStr,
         trim: String(r?.trimStrings || ''),
         scope: scopeLabel,
-        placements: placementLabels,
+        placements: placementLabels,        // 仅用于显示
+        placementCodes: placements,         // 用于执行（数字数组）
         disabled: !!r?.disabled,
         markdownOnly: !!r?.markdownOnly,
         promptOnly: !!r?.promptOnly,
@@ -1571,6 +1575,126 @@ function normalizeRegexScript(r, scopeLabel) {
         maxDepth: r?.maxDepth ?? null,
         dangers: scanRegexDangers(replaceStr),
     };
+}
+
+// ===== v0.5.17-regex.3 酒馆正则执行引擎 =====
+// 设计原则：总开关 OFF 时此处所有函数都不被调用，渲染管线零开销
+
+// 解析酒馆 findRegex（"/pattern/flags" 或 "pattern"）
+function parseTavernFindRegex(src) {
+    if (!src) return null;
+    try {
+        const m = String(src).match(/^\/(.+)\/([gimsuy]*)$/s);
+        if (m) return new RegExp(m[1], m[2]);
+        return new RegExp(src);
+    } catch { return null; }
+}
+
+// 把 ST 风格 macro 转成 JS replace 语法（最小可用集）
+// {{match}} → $&   {{user}}/{{char}} → 仅做静态字面替换（如能拿到）
+function transformReplaceMacros(replace, ctx) {
+    if (!replace) return '';
+    let out = String(replace);
+    out = out.replace(/\{\{\s*match\s*\}\}/gi, '$&');
+    if (ctx) {
+        if (ctx.user != null) out = out.replace(/\{\{\s*user\s*\}\}/gi, ctx.user);
+        if (ctx.char != null) out = out.replace(/\{\{\s*char\s*\}\}/gi, ctx.char);
+    }
+    return out;
+}
+
+// 解析 trimStrings（按行或逗号分隔，去空）
+function parseTrimStrings(s) {
+    if (!s) return [];
+    return String(s).split(/[\r\n,]+/).map(t => t.trim()).filter(Boolean);
+}
+
+// 编译一条规则成可执行形式；失败返回 null
+function compileTavernRule(r, ctx) {
+    const regex = parseTavernFindRegex(r.find);
+    if (!regex) return null;
+    return {
+        id: r.id,
+        name: r.name,
+        regex,
+        replace: transformReplaceMacros(r.replace, ctx),
+        trims: parseTrimStrings(r.trim),
+        placementCodes: r.placementCodes || [],
+    };
+}
+
+// 构建当前阅读上下文下的"启用规则列表"
+// 返回 null 表示：总开关关 / 没规则 / 出错 → 渲染管线短路（行为与正式版一致）
+function buildActiveTavernRules(charAvatar) {
+    let cur;
+    try { cur = loadSettings(); } catch { return null; }
+    if (!cur || !cur.regexEngineEnabled) return null;     // ←★ 唯一短路点
+    const enabledMap = cur.regexEnabled || { global: {}, byChar: {} };
+    const out = [];
+    // 准备 macro 上下文
+    let macroCtx = null;
+    try {
+        const ctx = (typeof getContext === 'function') ? getContext() : null;
+        const userName = ctx?.name1 || (typeof name1 !== 'undefined' ? name1 : null);
+        let charName = null;
+        if (charAvatar && Array.isArray(ctx?.characters)) {
+            const c = ctx.characters.find(x => x?.avatar === charAvatar);
+            if (c) charName = c.name;
+        }
+        macroCtx = { user: userName, char: charName };
+    } catch { /* ignore */ }
+
+    // 全局
+    try {
+        const g = getGlobalRegexes().global || [];
+        const allow = enabledMap.global || {};
+        for (const r of g) {
+            if (!r.id || !allow[r.id]) continue;
+            if (r.disabled || r.promptOnly) continue;
+            const c = compileTavernRule(r, macroCtx);
+            if (c) out.push(c);
+        }
+    } catch { /* ignore */ }
+
+    // 角色
+    if (charAvatar && enabledMap.byChar && enabledMap.byChar[charAvatar]) {
+        try {
+            const cached = _charRegexCache.get(charAvatar);
+            const list = (cached && Array.isArray(cached.scripts)) ? cached.scripts : [];
+            const allow = enabledMap.byChar[charAvatar];
+            for (const r of list) {
+                if (!r.id || !allow[r.id]) continue;
+                if (r.disabled || r.promptOnly) continue;
+                const c = compileTavernRule(r, macroCtx);
+                if (c) out.push(c);
+            }
+        } catch { /* ignore */ }
+    }
+
+    return out.length ? out : null;
+}
+
+// 应用规则到一段消息文本；任意单条规则失败都不影响其他规则
+// rules 必须非 null（外部已判过）；isUser 决定 placement 过滤
+function applyTavernRules(text, isUser, rules) {
+    if (!text || !rules || !rules.length) return text;
+    let out = text;
+    for (const r of rules) {
+        // placement: 1=用户输入, 2=AI 输出；若声明了 placement 但当前消息角色不在内则跳过
+        const codes = r.placementCodes;
+        if (codes && codes.length) {
+            const want = isUser ? 1 : 2;
+            if (!codes.includes(want)) continue;
+        }
+        try {
+            out = out.replace(r.regex, r.replace);
+            for (const t of r.trims) {
+                if (!t) continue;
+                out = out.split(t).join('');
+            }
+        } catch { /* 单条规则失败：保留当前 out，继续下一条 */ }
+    }
+    return out;
 }
 
 // 按设置剥离 message text（删掉指定标签包裹的内容）
@@ -1985,15 +2109,24 @@ function renderReader() {
     // v0.5.15 fix: renderReader 顶层没有 s 变量，必须显式 load
     const _readerCfg = loadSettings();
     const _useRichRender = _readerCfg.readerRichRender !== false;
+    // v0.5.17-regex.3 一次性构建当前阅读上下文的酒馆正则规则列表
+    // 总开关 OFF / 无规则 → null → 下方逻辑零分配短路
+    let _tavRules = null;
+    try { _tavRules = buildActiveTavernRules(readerState.character?.avatar); } catch { _tavRules = null; }
 
     const cardHtml = slice.map(m => {
         const who = escapeHtml(m.who);
         // 把消息按段落（连续换行视作分段）拆成 <p>，单换行保留为 <br>，便于首行缩进
         // 每个非空"行"包成一段，让首行缩进对每段生效（包含连续换行产生的空行也被丢弃）
-        const text = m.text
+        // v0.5.17-regex.3：若开启酒馆正则引擎，先对原文做规则替换；否则 _tavRules===null 直接走原管线
+        let _rawText = m.text;
+        if (_tavRules && _rawText) {
+            try { _rawText = applyTavernRules(_rawText, m.is_user, _tavRules); } catch { /* keep original */ }
+        }
+        const text = _rawText
             ? ((_useRichRender
-                    ? sanitizeMd(renderRichMd(m.text))
-                    : renderLiteMd(m.text))
+                    ? sanitizeMd(renderRichMd(_rawText))
+                    : renderLiteMd(_rawText))
                 || '<span class="cv-reader-empty">（空）</span>')
             : '<span class="cv-reader-empty">（空）</span>';
         // user 头像：若聊天 meta 里绑定了 persona 文件名，走 /thumbnail（零附加存储）；否则首字徽章
@@ -3911,9 +4044,24 @@ function injectSettings() {
               <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
+              <!-- v0.5.17-regex.3 总开关（默认关，关闭时整个引擎完全旁路） -->
+              <div class="cv-regex-master ${s.regexEngineEnabled ? 'cv-regex-master-on' : ''}" id="cv_regex_master_box">
+                <label class="checkbox_label" for="cv_regex_engine_enabled" style="font-weight:600;">
+                  <input type="checkbox" id="cv_regex_engine_enabled" ${s.regexEngineEnabled ? 'checked' : ''}>
+                  <span>⚡ 启用酒馆正则渲染（在阅读模式应用已勾选的正则）</span>
+                </label>
+                <div class="cv-settings-hint" style="margin-top:6px;">
+                  ⚠️ <b>这是真正"通电"开关</b>：开启后，下方<b>勾选了「在 ChatVault 启用」</b>的正则会在阅读消息时执行替换。<br>
+                  ⚠️ 含 ⚠ 危险标记的正则可能引入 XSS（脚本/事件/iframe 等）。最终会经 ChatVault 的 DOMPurify 兜底，但仍建议仔细审查。<br>
+                  ⚠️ 正则若写得太宽松可能导致页面卡顿（catastrophic backtrack）。<br>
+                  💡 <b>关闭此开关 = 完全回归正式版行为</b>，引擎彻底旁路、零开销、零副作用。
+                </div>
+              </div>
+              <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
+
               <div class="cv-settings-hint" style="margin-bottom:8px;">
-                ⚠️ <b>实验功能</b>：仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入、不会影响阅读模式渲染。<br>
-                💡 「在 ChatVault 启用」勾选框只是记录意向，<b>当前未通电</b>——勾上也不会跑。<br>
+                ⚠️ <b>实验功能</b>：仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入。<br>
+                💡 「在 ChatVault 启用」勾选框只是记录意向；要真正生效，需打开上方总开关。<br>
                 ⚙️ 要新增/编辑/删除正则，请到酒馆原生「正则」扩展面板操作。
               </div>
 
@@ -4126,6 +4274,36 @@ function injectSettings() {
     charListEl.addEventListener('click', regexCardEvtHandler);
     globalListEl.addEventListener('change', regexCvToggleHandler);
     charListEl.addEventListener('change', regexCvToggleHandler);
+
+    // 总开关：通电 / 断电
+    const masterCb = wrap.querySelector('#cv_regex_engine_enabled');
+    const masterBox = wrap.querySelector('#cv_regex_master_box');
+    masterCb.addEventListener('change', (e) => {
+        const cur = loadSettings();
+        if (e.target.checked) {
+            // 二次确认（输入「开启」才生效）
+            const ans = window.prompt(
+                '⚠️ 即将启用「酒馆正则渲染」\n\n' +
+                '此功能会让勾选过「在 ChatVault 启用」的酒馆正则在阅读消息时执行替换。\n' +
+                '含 ⚠ 危险标记的正则可能引入 XSS（最终经 DOMPurify 兜底，但仍有风险）。\n' +
+                '正则若写得太宽松可能让页面卡死。\n\n' +
+                '若理解风险并确认开启，请输入「开启」：'
+            );
+            if (ans !== '开启') {
+                e.target.checked = false;
+                return;
+            }
+            saveSettings({ ...cur, regexEngineEnabled: true });
+            masterBox.classList.add('cv-regex-master-on');
+        } else {
+            saveSettings({ ...cur, regexEngineEnabled: false });
+            masterBox.classList.remove('cv-regex-master-on');
+        }
+        // 若阅读模式正打开，重渲染立即生效
+        if (typeof readerState !== 'undefined' && readerState && readerState.active) {
+            try { renderReader(); } catch {}
+        }
+    });
 
     // 全局重扫
     wrap.querySelector('#cv_regex_global_refresh').addEventListener('click', (e) => {
