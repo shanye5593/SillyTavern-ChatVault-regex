@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.13';
+const VERSION = '0.5.17-regex.14';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -2071,12 +2071,27 @@ function _escapeAttr(s) {
 // 因为 sandbox 不带 allow-same-origin，脚本能跑但拿不到父 DOM；只能 postMessage
 function _buildResizerScript(id) {
     const idLit = JSON.stringify(id);
-    // v0.5.17-regex.12：不再注入会覆盖用户卡的 CSS（v0.5.17-regex.11 用 height:auto 把状态栏卡压扁渲染不出来）
-    //  - 反馈循环用"双向阈值 + debounce"控制，不动用户 CSS
-    //  - 测量综合 scrollHeight / offsetHeight（不同卡布局兼容性更好）
-    //  - 仅在变化 > 4px 时才上报（之前 2px 在 iOS 像素比下仍可能抖）
+    // v0.5.17-regex.14：黑科技路径 —— 借力酒馆助手主页面 API
+    //  - sandbox 已改为 allow-scripts allow-same-origin（见 cardHtml 处）
+    //  - 此脚本：① 把 parent 的关键全局（TavernHelper / SillyTavern / jQuery / $ / YAML / z / toastr）
+    //    挂到 iframe 内 window，状态栏卡的 JS 写 TavernHelper.getChatMessages() 能直接工作；
+    //    ② 高度自适应（postMessage + debounce + 双向阈值）
+    //
+    // 信任模型：用户卡是用户自己上传的角色资产，与酒馆助手在主聊天的信任代价等同。
     // 注意：</script> 必须用 <\/script> 防止内嵌字符串提前关闭外层 script
     return `<script>(function(){
+// === bridge: 注入主页面酒馆助手等全局 API ===
+try{
+  var p=window.parent;
+  if(p&&p!==window){
+    var keys=['TavernHelper','SillyTavern','toastr','jQuery','$','YAML','z','iframe_client'];
+    for(var i=0;i<keys.length;i++){
+      var k=keys[i];
+      try{ if(p[k]&&typeof window[k]==='undefined') window[k]=p[k]; }catch(e){}
+    }
+  }
+}catch(e){}
+// === height resizer: postMessage 高度回报（双向阈值防反馈循环）===
 var _id=${idLit},_last=-1,_t=null;
 function measure(){
   var b=document.body,h=document.documentElement;
@@ -2390,24 +2405,24 @@ function renderReader() {
         if (m.iframeSrc) {
             const ifrId = `cv-ifr-${readerState.character?.avatar || 'x'}-${m.idx}`;
             const wrapped = _wrapDocWithResizer(m.iframeSrc, ifrId);
-            // sandbox="allow-scripts" → JS 能跑（状态栏交互可工作），但视为 null origin（DOM 隔离 / 不能读 cookie）
-            // v0.5.17-regex.12：初始给 60px 兜底高度（v0.5.17-regex.11 的 height:0 在 postMessage 没到时
-            // 整张卡完全不可见 —— 用户卡 CSS 复杂，宁可初始有点空白也不要彻底瞎）
-            // postMessage 到达后会被替换为实际高度
+            // v0.5.17-regex.14：sandbox 改为 allow-scripts + allow-same-origin
+            // 让 iframe 跟父页面同 origin，能共享浏览器 cache（字体/图片大幅提速）+ 调 parent.TavernHelper
+            // 信任代价：用户上传的角色卡 JS 在阅读模式里获得与主聊天等同的能力（已与用户确认）
             const ifrTag = `<iframe class="cv-msg-iframe" data-cv-iframe-id="${_escapeAttr(ifrId)}" `
-                 + `sandbox="allow-scripts" referrerpolicy="no-referrer" scrolling="no" `
+                 + `sandbox="allow-scripts allow-same-origin" referrerpolicy="no-referrer" scrolling="no" `
                  + `style="width:100%;border:0;background:transparent;display:block;height:60px;" `
                  + `srcdoc="${_escapeAttr(wrapped)}"></iframe>`;
-            // 前后文本走原管线（已 strip/extract，再 markdown + sanitize）
+            // v0.5.17-regex.14：iframe 模式下 before/after 不走 markdown
+            // 之前走 markdown 时孤立 `|` / `<wrapper>` 残片会被渲染成空 table 浅灰圆角条
+            // 改为：trim + 噪声清理（_stripIframeWrapNoise 已处理），剩余文本纯 escape 显示
+            // 损失可接受：iframe 卡前后通常是噪声残片或简短对话文本，markdown 损失值得换取无 | bug
             const beforeT = (m.iframeBefore || '').trim();
             const afterT = (m.iframeAfter || '').trim();
-            const beforeProcessed = beforeT ? processMessageText(beforeT, _readerCfg.strip, _readerCfg.extract) : '';
-            const afterProcessed = afterT ? processMessageText(afterT, _readerCfg.strip, _readerCfg.extract) : '';
-            const beforeHtml = beforeProcessed
-                ? (_useRichRender ? sanitizeMd(renderRichMd(beforeProcessed), _sanitizeMode) : renderLiteMd(beforeProcessed))
+            const beforeHtml = beforeT
+                ? `<div class="cv-iframe-side-text">${escapeHtml(beforeT)}</div>`
                 : '';
-            const afterHtml = afterProcessed
-                ? (_useRichRender ? sanitizeMd(renderRichMd(afterProcessed), _sanitizeMode) : renderLiteMd(afterProcessed))
+            const afterHtml = afterT
+                ? `<div class="cv-iframe-side-text">${escapeHtml(afterT)}</div>`
                 : '';
             text = beforeHtml + ifrTag + afterHtml;
         } else {
