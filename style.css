@@ -2239,3 +2239,32 @@
     padding: 0 0 4px;
     margin-top: 0;
 }
+
+/* ============================================================
+ *  v0.5.17-regex.0  酒馆正则只读列表样式
+ * ============================================================ */
+.cv-regex-list { display: flex; flex-direction: column; gap: 12px; }
+.cv-regex-group { border: 1px solid var(--cv-border, rgba(127,127,127,0.25)); border-radius: 8px; padding: 8px; background: rgba(127,127,127,0.04); }
+.cv-regex-group-head { font-weight: 600; padding: 4px 4px 8px; display: flex; align-items: center; gap: 6px; opacity: 0.92; }
+.cv-regex-count { font-size: 0.8em; opacity: 0.7; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.15); }
+.cv-regex-item { border: 1px solid var(--cv-border, rgba(127,127,127,0.2)); border-radius: 6px; padding: 6px 8px; margin-top: 6px; background: var(--cv-bg-card, rgba(0,0,0,0.04)); }
+.cv-regex-item.cv-regex-has-danger { border-color: rgba(225,85,85,0.55); background: rgba(225,85,85,0.06); }
+.cv-regex-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cv-regex-toggle { background: none; border: none; cursor: pointer; font-size: 0.85em; padding: 0 4px; transition: transform 0.15s; opacity: 0.7; }
+.cv-regex-expanded .cv-regex-toggle { transform: rotate(90deg); }
+.cv-regex-name { font-weight: 600; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.cv-regex-state { font-size: 0.78em; padding: 1px 6px; border-radius: 8px; }
+.cv-regex-enabled { background: rgba(80,180,120,0.18); color: #4caf6a; }
+.cv-regex-disabled { background: rgba(127,127,127,0.18); opacity: 0.7; }
+.cv-regex-danger { font-size: 0.78em; padding: 1px 6px; border-radius: 8px; background: rgba(225,85,85,0.18); color: #e15555; font-weight: 600; }
+.cv-regex-danger-inline { color: #e15555; font-weight: 600; }
+.cv-regex-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.cv-regex-tag { font-size: 0.75em; padding: 1px 6px; border-radius: 8px; background: rgba(80,140,200,0.18); color: var(--cv-accent, #5a92c8); }
+.cv-regex-tag-mute { background: rgba(127,127,127,0.12); color: inherit; opacity: 0.55; }
+.cv-regex-meta { font-size: 0.74em; opacity: 0.65; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.1); }
+.cv-regex-body { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--cv-border, rgba(127,127,127,0.25)); flex-direction: column; gap: 8px; }
+.cv-regex-expanded .cv-regex-body { display: flex; }
+.cv-regex-field-head { display: flex; align-items: center; justify-content: space-between; font-size: 0.82em; font-weight: 600; opacity: 0.85; margin-bottom: 3px; }
+.cv-regex-copy { background: none; border: 1px solid var(--cv-border, rgba(127,127,127,0.3)); border-radius: 4px; cursor: pointer; font-size: 0.78em; padding: 1px 8px; opacity: 0.75; }
+.cv-regex-copy:hover { opacity: 1; }
+.cv-regex-code { margin: 0; padding: 6px 8px; max-height: 240px; overflow: auto; background: rgba(0,0,0,0.18); color: inherit; border-radius: 4px; font-size: 0.78em; font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace; line-height: 1.45; white-space: pre-wrap; word-break: break-all; }

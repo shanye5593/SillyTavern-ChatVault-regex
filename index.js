@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.10';
+const VERSION = '0.5.17-regex.0';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -1347,6 +1347,158 @@ async function fetchFullChat(character, fileName) {
 }
 
 function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/* ============================================================
+ *  v0.5.17-regex.0  酒馆正则只读列表（实验功能，未接入渲染管线）
+ *  仅扫描和展示，不修改、不写入、不影响阅读模式渲染
+ * ============================================================ */
+
+// 酒馆正则 placement 含义（按 ST 源码 regex/engine.js 约定）
+const TAV_REGEX_PLACEMENT_LABELS = {
+    1: '用户输入',
+    2: 'AI 输出',
+    3: '快捷命令',
+    4: '世界信息',
+    5: '推理',
+};
+
+// 危险模式：在替换内容里命中即标红
+const TAV_REGEX_DANGER_PATTERNS = [
+    { re: /<script[\s>]/i,                       tag: 'script' },
+    { re: /\son[a-z]+\s*=/i,                     tag: 'on*事件' },
+    { re: /javascript:/i,                        tag: 'javascript:' },
+    { re: /\beval\s*\(/i,                        tag: 'eval' },
+    { re: /\bnew\s+Function\s*\(/i,              tag: 'new Function' },
+    { re: /<iframe[\s>]/i,                       tag: 'iframe' },
+    { re: /\bfetch\s*\(/i,                       tag: 'fetch' },
+    { re: /\bXMLHttpRequest\b/,                  tag: 'XHR' },
+    { re: /\bimport\s*\(/,                       tag: 'dynamic import' },
+];
+
+function scanRegexDangers(replaceStr) {
+    if (typeof replaceStr !== 'string' || !replaceStr) return [];
+    const hits = [];
+    for (const p of TAV_REGEX_DANGER_PATTERNS) {
+        if (p.re.test(replaceStr)) hits.push(p.tag);
+    }
+    return hits;
+}
+
+// 从酒馆运行时读全部正则：全局 + 每个角色卡的角色正则
+// 返回 { global: [...], byChar: [{name, avatar, scripts:[...]}, ...], errors: [...] }
+function getTavernRegexes() {
+    const out = { global: [], byChar: [], errors: [] };
+    let ctx;
+    try { ctx = SillyTavern.getContext(); } catch (e) {
+        out.errors.push('无法获取酒馆上下文：' + e.message);
+        return out;
+    }
+    // 全局正则
+    try {
+        const ext = ctx.extensionSettings || (typeof extension_settings !== 'undefined' ? extension_settings : null);
+        const arr = ext && Array.isArray(ext.regex) ? ext.regex : [];
+        out.global = arr.map(r => normalizeRegexScript(r, '全局'));
+    } catch (e) {
+        out.errors.push('读取全局正则失败：' + e.message);
+    }
+    // 角色正则
+    try {
+        const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+        for (const c of chars) {
+            const scripts = c?.data?.extensions?.regex_scripts;
+            if (!Array.isArray(scripts) || scripts.length === 0) continue;
+            out.byChar.push({
+                name: c.name || '(未命名)',
+                avatar: c.avatar || '',
+                scripts: scripts.map(r => normalizeRegexScript(r, '角色: ' + (c.name || '?'))),
+            });
+        }
+    } catch (e) {
+        out.errors.push('读取角色正则失败：' + e.message);
+    }
+    return out;
+}
+
+// 渲染单条正则的卡片 HTML（折叠卡片，标题行 + 展开后的 find/replace/trim/属性）
+function renderRegexItemHtml(it, key) {
+    const dangerHtml = it.dangers.length
+        ? `<span class="cv-regex-danger" title="替换内容里命中可执行/危险模式">⚠ ${it.dangers.map(escapeHtml).join(' / ')}</span>`
+        : '';
+    const placementHtml = it.placements.length
+        ? it.placements.map(p => `<span class="cv-regex-tag">${escapeHtml(p)}</span>`).join('')
+        : '<span class="cv-regex-tag cv-regex-tag-mute">(无作用范围)</span>';
+    const stateHtml = it.disabled
+        ? '<span class="cv-regex-state cv-regex-disabled">已禁用</span>'
+        : '<span class="cv-regex-state cv-regex-enabled">已启用</span>';
+    const depthHtml = (it.minDepth != null || it.maxDepth != null)
+        ? `<span class="cv-regex-meta">深度 ${it.minDepth ?? '∞'} ~ ${it.maxDepth ?? '∞'}</span>`
+        : '';
+    const flagHtml = [
+        it.markdownOnly ? '仅格式显示' : '',
+        it.promptOnly   ? '仅格式提示词' : '',
+        it.runOnEdit    ? '编辑时运行' : '',
+    ].filter(Boolean).map(t => `<span class="cv-regex-meta">${escapeHtml(t)}</span>`).join('');
+    return `
+      <div class="cv-regex-item ${it.dangers.length ? 'cv-regex-has-danger' : ''}" data-key="${escapeHtml(key)}">
+        <div class="cv-regex-head">
+          <button class="cv-regex-toggle" type="button" title="展开/收起">▶</button>
+          <span class="cv-regex-name">${escapeHtml(it.name)}</span>
+          ${stateHtml}
+          ${dangerHtml}
+        </div>
+        <div class="cv-regex-tags">
+          ${placementHtml}
+          ${depthHtml}
+          ${flagHtml}
+        </div>
+        <div class="cv-regex-body">
+          <div class="cv-regex-field">
+            <div class="cv-regex-field-head">
+              <span>查找正则</span>
+              <button class="cv-regex-copy" type="button" data-copy="${escapeHtml(it.find)}">📋 复制</button>
+            </div>
+            <pre class="cv-regex-code">${escapeHtml(it.find) || '<i style="opacity:0.5;">(空)</i>'}</pre>
+          </div>
+          <div class="cv-regex-field">
+            <div class="cv-regex-field-head">
+              <span>替换为${it.dangers.length ? '<span class="cv-regex-danger-inline"> ⚠ 含可执行代码</span>' : ''}</span>
+              <button class="cv-regex-copy" type="button" data-copy="${escapeHtml(it.replace)}">📋 复制</button>
+            </div>
+            <pre class="cv-regex-code">${escapeHtml(it.replace) || '<i style="opacity:0.5;">(空)</i>'}</pre>
+          </div>
+          ${it.trim ? `
+          <div class="cv-regex-field">
+            <div class="cv-regex-field-head"><span>修剪</span></div>
+            <pre class="cv-regex-code">${escapeHtml(it.trim)}</pre>
+          </div>` : ''}
+        </div>
+      </div>
+    `;
+}
+
+function normalizeRegexScript(r, scopeLabel) {
+    const placements = Array.isArray(r?.placement) ? r.placement : [];
+    const placementLabels = placements
+        .map(n => TAV_REGEX_PLACEMENT_LABELS[Number(n)] || ('?' + n))
+        .filter(Boolean);
+    const replaceStr = String(r?.replaceString || '');
+    return {
+        id: String(r?.id || ''),
+        name: String(r?.scriptName || '(未命名)'),
+        find: String(r?.findRegex || ''),
+        replace: replaceStr,
+        trim: String(r?.trimStrings || ''),
+        scope: scopeLabel,
+        placements: placementLabels,
+        disabled: !!r?.disabled,
+        markdownOnly: !!r?.markdownOnly,
+        promptOnly: !!r?.promptOnly,
+        runOnEdit: !!r?.runOnEdit,
+        minDepth: r?.minDepth ?? null,
+        maxDepth: r?.maxDepth ?? null,
+        dangers: scanRegexDangers(replaceStr),
+    };
+}
 
 // 按设置剥离 message text（删掉指定标签包裹的内容）
 function applyStripping(text, strip) {
@@ -3613,6 +3765,27 @@ function injectSettings() {
           </div>
           <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
 
+          <!-- 酒馆正则只读列表（v0.5.17-regex.0 实验功能；只展示，不接渲染） -->
+          <div class="inline-drawer cv-sub-drawer" id="cv_regex_drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+              <b>🧪 酒馆正则列表（实验/只读）</b>
+              <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+              <div class="cv-settings-hint" style="margin-bottom:8px;">
+                ⚠️ <b>实验功能</b>：当前仅扫描和展示酒馆里已有的正则脚本，<b>不会</b>修改、不会写入、不会影响阅读模式渲染。<br>
+                所有数据从酒馆运行时读取（全局正则 + 每张角色卡上的角色正则），ChatVault 不做本地拷贝。<br>
+                ⚙️ 要新增/编辑/删除正则，请到酒馆原生「正则」扩展面板操作。
+              </div>
+              <div class="cv-settings-row">
+                <button id="cv_regex_refresh" class="menu_button cv-inline-btn">🔄 重新扫描</button>
+                <span id="cv_regex_summary" class="cv-settings-hint" style="margin-left:8px;"></span>
+              </div>
+              <div id="cv_regex_list" class="cv-regex-list" style="margin-top:8px;"></div>
+            </div>
+          </div>
+          <hr style="border:none; border-top:1px solid var(--cv-border, rgba(127,127,127,0.25)); margin:10px 0;">
+
           <!-- 字体设置（折叠） -->
           <div class="inline-drawer cv-sub-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
@@ -3705,6 +3878,78 @@ function injectSettings() {
             try { renderReader(); } catch {}
         }
     });
+    // ----- 酒馆正则只读列表 -----
+    const regexListEl = wrap.querySelector('#cv_regex_list');
+    const regexSummaryEl = wrap.querySelector('#cv_regex_summary');
+    const renderRegexList = () => {
+        const data = getTavernRegexes();
+        const totalGlobal = data.global.length;
+        const totalCharScripts = data.byChar.reduce((n, c) => n + c.scripts.length, 0);
+        const totalChars = data.byChar.length;
+        const dangerCount = [
+            ...data.global,
+            ...data.byChar.flatMap(c => c.scripts),
+        ].filter(s => s.dangers.length > 0).length;
+        regexSummaryEl.innerHTML =
+            `共 <b>${totalGlobal}</b> 条全局 · <b>${totalCharScripts}</b> 条角色正则（来自 ${totalChars} 张角色卡）` +
+            (dangerCount ? ` · <span style="color:#e15555;">⚠ ${dangerCount} 条含危险代码</span>` : '');
+        const groups = [];
+        if (data.global.length) groups.push({ title: '🌐 全局正则', items: data.global, anchor: 'global' });
+        for (const c of data.byChar) {
+            groups.push({ title: '🎭 ' + c.name, items: c.scripts, anchor: c.avatar || c.name });
+        }
+        if (groups.length === 0) {
+            regexListEl.innerHTML = `<div class="cv-settings-hint" style="opacity:0.7;">酒馆里没有任何正则脚本（全局和角色卡都为空）。</div>`;
+        } else {
+            regexListEl.innerHTML = groups.map(g => `
+                <div class="cv-regex-group">
+                    <div class="cv-regex-group-head">${escapeHtml(g.title)} <span class="cv-regex-count">${g.items.length}</span></div>
+                    ${g.items.map((it, idx) => renderRegexItemHtml(it, g.anchor + '-' + idx)).join('')}
+                </div>
+            `).join('');
+        }
+        if (data.errors.length) {
+            const err = document.createElement('div');
+            err.className = 'cv-settings-hint';
+            err.style.cssText = 'color:#e15555; margin-top:8px;';
+            err.textContent = '读取错误：' + data.errors.join('; ');
+            regexListEl.appendChild(err);
+        }
+    };
+    // 折叠展开 / 复制按钮事件委托
+    regexListEl.addEventListener('click', (e) => {
+        const tog = e.target.closest('.cv-regex-toggle');
+        if (tog) {
+            e.preventDefault();
+            const card = tog.closest('.cv-regex-item');
+            if (card) card.classList.toggle('cv-regex-expanded');
+            return;
+        }
+        const cp = e.target.closest('.cv-regex-copy');
+        if (cp) {
+            e.preventDefault();
+            const txt = cp.dataset.copy || '';
+            try {
+                navigator.clipboard.writeText(txt);
+                cp.textContent = '✓ 已复制';
+                setTimeout(() => { cp.textContent = '📋 复制'; }, 1200);
+            } catch { /* ignore */ }
+        }
+    });
+    wrap.querySelector('#cv_regex_refresh').addEventListener('click', (e) => {
+        e.preventDefault();
+        renderRegexList();
+    });
+    // 折叠区首次展开时再渲染（避免影响设置面板初次打开速度）
+    const regexDrawer = wrap.querySelector('#cv_regex_drawer');
+    let _regexRendered = false;
+    regexDrawer.querySelector('.inline-drawer-toggle').addEventListener('click', () => {
+        if (_regexRendered) return;
+        _regexRendered = true;
+        // 等折叠动画起步后再渲染，避免阻塞
+        setTimeout(() => renderRegexList(), 0);
+    });
+
     wrap.querySelector('#cv_set_theme').addEventListener('change', (e) => {
         const cur = loadSettings();
         const newTheme = e.target.value;
