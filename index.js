@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.7';
+const VERSION = '0.5.17-regex.8';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -1952,6 +1952,11 @@ const _DP_PERMISSIVE_CFG = {
         'defs', 'linearGradient', 'radialGradient', 'stop',
         'clipPath', 'mask', 'pattern',
         'filter', 'feGaussianBlur', 'feOffset', 'feMerge', 'feMergeNode',
+        // v0.5.17-regex.8：常见状态栏/美化正则用的自定义容器标签（等同 <div>，无原生行为）
+        'hl_status_widget_v2', 'hl_status_widget', 'status_widget', 'status',
+        'podcast', 'card', 'panel', 'widget', 'box', 'section-card',
+        'thinking', 'think', 'reasoning', 'recall', 'memory', 'note',
+        'character_status', 'char_status', 'sys_ui', 'sys-ui', 'ui',
     ]),
     ALLOWED_ATTR: _DP_SAFE_CFG.ALLOWED_ATTR.concat([
         // 仅放行无害的语义/无障碍属性 —— 故意不含 id / name / xmlns（DOM clobbering & SVG 命名空间风险）
@@ -1992,6 +1997,30 @@ function _hardenStyleHook(node, data) {
             : 'url()';
     });
     if (out !== css) node.textContent = out;
+}
+
+// v0.5.17-regex.8：完整 HTML 文档展平
+// 用户酒馆正则的 replace 经常输出整段 <!DOCTYPE><html><head><style>...</style></head><body>...</body></html>，
+// 而 ChatVault 的 renderRichMd 只接受 <a-zA-Z 开头的"HTML 直通行"，<!DOCTYPE 会被当文字 escape；
+// DOMPurify 在 fragment 模式下也无法保留 head 里的 style。
+// 此函数检测完整文档，用 DOMParser 展平为：<style>(head 提取)</style> + body innerHTML 拼接。
+// 不是完整文档时原样返回。
+function _flattenFullDocument(html) {
+    if (!html || typeof html !== 'string') return html;
+    // 触发条件：以 <!DOCTYPE 或 <html 开头（允许前置空白）
+    if (!/^\s*<(?:!doctype\s+html|html\b)/i.test(html)) return html;
+    try {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        if (!doc) return html;
+        // 提取 head 里的 <style>（保留 UI 字体/排版规则）；其它 head 元素（meta/title/link/script）一律丢弃
+        const headStyles = Array.from(doc.head ? doc.head.querySelectorAll('style') : [])
+            .map(s => s.outerHTML).join('\n');
+        const bodyHtml = doc.body ? doc.body.innerHTML : '';
+        return headStyles + (headStyles && bodyHtml ? '\n' : '') + bodyHtml;
+    } catch (e) {
+        console.warn('[ChatVault] _flattenFullDocument 失败，按原文走：', e);
+        return html;
+    }
 }
 
 function sanitizeMd(html, mode) {
@@ -2174,7 +2203,12 @@ function renderReader() {
             // 第 1 步：酒馆正则（仅当总开关开 + 有规则时；关时 _tavRules===null 整个分支跳过）
             let raw = (m && typeof m.mes === 'string') ? m.mes : '';
             if (_tavRules && raw) {
-                try { raw = applyTavernRules(raw, isUser, _tavRules); } catch { /* keep raw */ }
+                try {
+                    raw = applyTavernRules(raw, isUser, _tavRules);
+                    // v0.5.17-regex.8：若正则输出整段 HTML 文档（<!DOCTYPE>/<html>），展平为 fragment
+                    // 把 <head> 里的 <style> 保留拼到 body 前，外壳标签丢弃。非完整文档原样返回。
+                    raw = _flattenFullDocument(raw);
+                } catch { /* keep raw */ }
             }
             // 第 2 步：ChatVault strip/extract（与正式版一致）
             const text = raw ? processMessageText(raw, s, e) : '';
