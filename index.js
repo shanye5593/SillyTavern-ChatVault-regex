@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.4';
+const VERSION = '0.5.17-regex.5';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -2087,8 +2087,15 @@ function renderReader() {
         ? `/thumbnail?type=persona&file=${encodeURIComponent(boundUserAvatarFile)}`
         : '';
 
-    // 处理 + 缓存（依赖 strip/extract/userRules 配置，不含 style）
-    const cfgSig = JSON.stringify({ s: cfg.strip, e: cfg.extract, u: cfg.userRules });
+    // v0.5.17-regex.5：先构建酒馆正则规则列表（关闭时为 null），并并入 cfgSig 做缓存键
+    // 顺序对齐酒馆原生：raw m.mes → 酒馆正则 → ChatVault strip/extract → cache → 渲染
+    let _tavRules = null;
+    try { _tavRules = buildActiveTavernRules(readerState.character?.avatar); } catch { _tavRules = null; }
+    // 缓存签名包含正则状态：关闭时 _tavRules===null，签名与正式版完全一致；开启/勾选变化都会让缓存失效
+    const _regexSig = _tavRules
+        ? { on: 1, ids: _tavRules.map(r => r.id) }
+        : 0;
+    const cfgSig = JSON.stringify({ s: cfg.strip, e: cfg.extract, u: cfg.userRules, r: _regexSig });
     if (readerState._cfgSig !== cfgSig || !readerState._processed) {
         readerState._cfgSig = cfgSig;
         readerState._processed = messages.map((m, idx) => {
@@ -2096,7 +2103,13 @@ function renderReader() {
             const useUser = cfg.userRules.enabled && isUser;
             const s = useUser ? cfg.userRules.strip : cfg.strip;
             const e = useUser ? cfg.userRules.extract : cfg.extract;
-            const text = (m && typeof m.mes === 'string') ? processMessageText(m.mes, s, e) : '';
+            // 第 1 步：酒馆正则（仅当总开关开 + 有规则时；关时 _tavRules===null 整个分支跳过）
+            let raw = (m && typeof m.mes === 'string') ? m.mes : '';
+            if (_tavRules && raw) {
+                try { raw = applyTavernRules(raw, isUser, _tavRules); } catch { /* keep raw */ }
+            }
+            // 第 2 步：ChatVault strip/extract（与正式版一致）
+            const text = raw ? processMessageText(raw, s, e) : '';
             // user 名字优先用消息自身记录的 m.name（兼容多 persona 聊天），否则用文件级 userName
             const rawName = m?.name && m.name !== 'unused' ? m.name : '';
             const who = isUser ? (rawName || userName) : (rawName || charName);
@@ -2125,24 +2138,14 @@ function renderReader() {
     // v0.5.15 fix: renderReader 顶层没有 s 变量，必须显式 load
     const _readerCfg = loadSettings();
     const _useRichRender = _readerCfg.readerRichRender !== false;
-    // v0.5.17-regex.3 一次性构建当前阅读上下文的酒馆正则规则列表
-    // 总开关 OFF / 无规则 → null → 下方逻辑零分配短路
-    let _tavRules = null;
-    try { _tavRules = buildActiveTavernRules(readerState.character?.avatar); } catch { _tavRules = null; }
 
     const cardHtml = slice.map(m => {
         const who = escapeHtml(m.who);
-        // 把消息按段落（连续换行视作分段）拆成 <p>，单换行保留为 <br>，便于首行缩进
-        // 每个非空"行"包成一段，让首行缩进对每段生效（包含连续换行产生的空行也被丢弃）
-        // v0.5.17-regex.3：若开启酒馆正则引擎，先对原文做规则替换；否则 _tavRules===null 直接走原管线
-        let _rawText = m.text;
-        if (_tavRules && _rawText) {
-            try { _rawText = applyTavernRules(_rawText, m.is_user, _tavRules); } catch { /* keep original */ }
-        }
-        const text = _rawText
+        // m.text 已经过【酒馆正则 → strip → extract】处理（v0.5.17-regex.5 起在 _processed 缓存层完成）
+        const text = m.text
             ? ((_useRichRender
-                    ? sanitizeMd(renderRichMd(_rawText))
-                    : renderLiteMd(_rawText))
+                    ? sanitizeMd(renderRichMd(m.text))
+                    : renderLiteMd(m.text))
                 || '<span class="cv-reader-empty">（空）</span>')
             : '<span class="cv-reader-empty">（空）</span>';
         // user 头像：若聊天 meta 里绑定了 persona 文件名，走 /thumbnail（零附加存储）；否则首字徽章
