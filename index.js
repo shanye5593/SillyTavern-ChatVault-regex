@@ -4,7 +4,7 @@
  * https://github.com/shanye5593/SillyTavern-ChatVault
  */
 
-const VERSION = '0.5.17-regex.8';
+const VERSION = '0.5.17-regex.9';
 const STORAGE_KEY = 'st-chatvault-meta';
 const SETTINGS_KEY = 'st-chatvault-settings';
 const PAGE_SIZE = 50;
@@ -1999,28 +1999,79 @@ function _hardenStyleHook(node, data) {
     if (out !== css) node.textContent = out;
 }
 
-// v0.5.17-regex.8：完整 HTML 文档展平
-// 用户酒馆正则的 replace 经常输出整段 <!DOCTYPE><html><head><style>...</style></head><body>...</body></html>，
-// 而 ChatVault 的 renderRichMd 只接受 <a-zA-Z 开头的"HTML 直通行"，<!DOCTYPE 会被当文字 escape；
-// DOMPurify 在 fragment 模式下也无法保留 head 里的 style。
-// 此函数检测完整文档，用 DOMParser 展平为：<style>(head 提取)</style> + body innerHTML 拼接。
-// 不是完整文档时原样返回。
-function _flattenFullDocument(html) {
-    if (!html || typeof html !== 'string') return html;
-    // 触发条件：以 <!DOCTYPE 或 <html 开头（允许前置空白）
-    if (!/^\s*<(?:!doctype\s+html|html\b)/i.test(html)) return html;
-    try {
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        if (!doc) return html;
-        // 提取 head 里的 <style>（保留 UI 字体/排版规则）；其它 head 元素（meta/title/link/script）一律丢弃
-        const headStyles = Array.from(doc.head ? doc.head.querySelectorAll('style') : [])
-            .map(s => s.outerHTML).join('\n');
-        const bodyHtml = doc.body ? doc.body.innerHTML : '';
-        return headStyles + (headStyles && bodyHtml ? '\n' : '') + bodyHtml;
-    } catch (e) {
-        console.warn('[ChatVault] _flattenFullDocument 失败，按原文走：', e);
-        return html;
+// v0.5.17-regex.9：完整 HTML 文档检测 + sandbox iframe 渲染
+// 背景：用户复杂的状态栏/美化卡（如 hl_status_widget_v2）实际依赖"酒馆助手"插件
+// （JS-Slash-Runner / TavernHelper），它的机制是把整段 <html><body> 代码包成 iframe
+// 沙箱执行。ChatVault 的阅读模式不在 ST 主聊天 DOM 流，酒馆助手的 hook 不会触发；
+// 所以再怎么放宽 DOMPurify 白名单都没用 —— CSS @import / 字体 / 状态栏布局都在 iframe 内才生效。
+//
+// AB 混合方案（用户决策）：
+//  - A：自己实现最小 sandbox iframe + srcdoc，永远工作（不依赖第三方插件）
+//  - B：未来可扩展检测 window.TavernHelper 调它的 API（当前先只做 A，B 留作 follow-up）
+//
+// 安全：
+//  - sandbox="allow-scripts" 让卡内 JS 能跑（状态栏交互），但 NOT allow-same-origin
+//    → iframe 视为 null origin，不能读 parent.cookie / parent.document（DOM 隔离）
+//  - 高度自适应通过 postMessage 通信，父侧 listener 校验消息结构 + clamp 高度上限
+
+function _isFullHtmlDoc(s) {
+    return typeof s === 'string' && /^\s*<(?:!doctype\s+html|html\b)/i.test(s);
+}
+
+// HTML 属性值 escape（仅用于 srcdoc=""）
+function _escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+}
+
+// 注入到 iframe 的高度自适应 + base 标签（让相对路径走父域，避免 about:srcdoc 解析失败）
+// 因为 sandbox 不带 allow-same-origin，脚本能跑但拿不到父 DOM；只能 postMessage
+function _buildResizerScript(id) {
+    const idLit = JSON.stringify(id);
+    // 注意：</script> 必须用 <\/script> 防止内嵌字符串提前关闭外层 script
+    return `<script>(function(){
+var _id=${idLit};
+function send(){try{
+  var d=document,b=d.body,h=d.documentElement;
+  var sh=Math.max(b?b.scrollHeight:0,h?h.scrollHeight:0,b?b.offsetHeight:0,h?h.offsetHeight:0);
+  parent.postMessage({type:'cv-iframe-h',id:_id,h:sh},'*');
+}catch(e){}}
+if(d=document,d.readyState==='complete')send();
+else window.addEventListener('load',send);
+try{new ResizeObserver(send).observe(document.documentElement);}catch(e){}
+window.addEventListener('resize',send);
+setTimeout(send,300);setTimeout(send,1500);
+})();<\/script>`;
+}
+
+// 把完整 HTML 文档加上高度自适应脚本，返回可塞入 iframe srcdoc 的字符串
+function _wrapDocWithResizer(html, id) {
+    const script = _buildResizerScript(id);
+    // 优先注入 </body> 前；找不到则附加到末尾（仍然有效）
+    if (/<\/body\s*>/i.test(html)) {
+        return html.replace(/<\/body\s*>/i, script + '</body>');
     }
+    return html + script;
+}
+
+// 父侧高度监听（一次性挂载，幂等）
+let _cvIframeMsgListenerAttached = false;
+function _ensureIframeMsgListener() {
+    if (_cvIframeMsgListenerAttached) return;
+    _cvIframeMsgListenerAttached = true;
+    window.addEventListener('message', (ev) => {
+        const d = ev && ev.data;
+        if (!d || d.type !== 'cv-iframe-h' || typeof d.id !== 'string' || typeof d.h !== 'number') return;
+        // clamp：最小 80px 防误报；最大 6000px 防恶意/失控撑爆
+        const h = Math.max(80, Math.min(6000, Math.floor(d.h) + 8));
+        try {
+            // CSS.escape 老浏览器可能没有；fallback 简单替换
+            const sel = (typeof CSS !== 'undefined' && CSS.escape)
+                ? `iframe[data-cv-iframe-id="${CSS.escape(d.id)}"]`
+                : `iframe[data-cv-iframe-id="${String(d.id).replace(/[^a-zA-Z0-9_-]/g, '')}"]`;
+            const ifr = document.querySelector(sel);
+            if (ifr) ifr.style.height = h + 'px';
+        } catch { /* noop */ }
+    });
 }
 
 function sanitizeMd(html, mode) {
@@ -2203,19 +2254,22 @@ function renderReader() {
             // 第 1 步：酒馆正则（仅当总开关开 + 有规则时；关时 _tavRules===null 整个分支跳过）
             let raw = (m && typeof m.mes === 'string') ? m.mes : '';
             if (_tavRules && raw) {
-                try {
-                    raw = applyTavernRules(raw, isUser, _tavRules);
-                    // v0.5.17-regex.8：若正则输出整段 HTML 文档（<!DOCTYPE>/<html>），展平为 fragment
-                    // 把 <head> 里的 <style> 保留拼到 body 前，外壳标签丢弃。非完整文档原样返回。
-                    raw = _flattenFullDocument(raw);
-                } catch { /* keep raw */ }
+                try { raw = applyTavernRules(raw, isUser, _tavRules); } catch { /* keep raw */ }
+            }
+            // v0.5.17-regex.9：若结果是整段 HTML 文档（<!DOCTYPE>/<html>），改走 sandbox iframe 路径
+            // 这是酒馆助手风格的状态栏卡 —— DOMPurify 白名单永远渲染不出来，只能 iframe 隔离
+            // 仅在总开关开（_tavRules 非 null）时启用；关时该字段始终 null，行为退回正式版
+            let iframeSrc = null;
+            if (_tavRules && _isFullHtmlDoc(raw)) {
+                iframeSrc = raw;
+                // text 仍保留原文，作为 iframe 加载失败时的降级显示（escape 后纯文本）
             }
             // 第 2 步：ChatVault strip/extract（与正式版一致）
             const text = raw ? processMessageText(raw, s, e) : '';
             // user 名字优先用消息自身记录的 m.name（兼容多 persona 聊天），否则用文件级 userName
             const rawName = m?.name && m.name !== 'unused' ? m.name : '';
             const who = isUser ? (rawName || userName) : (rawName || charName);
-            return { idx, who, is_user: isUser, text };
+            return { idx, who, is_user: isUser, text, iframeSrc };
         });
     }
     const processed = readerState._processed;
@@ -2244,15 +2298,33 @@ function renderReader() {
     // 关闭 → safe（与正式版一致）
     const _sanitizeMode = _tavRules ? 'permissive' : 'safe';
 
+    // v0.5.17-regex.9：iframe 路径用到 postMessage 高度回报，挂一次全局监听（幂等）
+    if (_tavRules) _ensureIframeMsgListener();
+
     const cardHtml = slice.map(m => {
         const who = escapeHtml(m.who);
-        // m.text 已经过【酒馆正则 → strip → extract】处理（v0.5.17-regex.5 起在 _processed 缓存层完成）
-        const text = m.text
-            ? ((_useRichRender
-                    ? sanitizeMd(renderRichMd(m.text), _sanitizeMode)
-                    : renderLiteMd(m.text))
-                || '<span class="cv-reader-empty">（空）</span>')
-            : '<span class="cv-reader-empty">（空）</span>';
+        // v0.5.17-regex.9：iframe 模式（酒馆助手风格的完整 HTML 文档卡）
+        // 用 sandbox iframe + srcdoc 隔离渲染，不经 DOMPurify（浏览器原生 sandbox 已是最强隔离）
+        let text;
+        if (m.iframeSrc) {
+            // 每条消息独立 id，便于父侧 postMessage 路由高度
+            const ifrId = `cv-ifr-${readerState.character?.avatar || 'x'}-${m.idx}`;
+            const wrapped = _wrapDocWithResizer(m.iframeSrc, ifrId);
+            // sandbox="allow-scripts" → JS 能跑（状态栏交互可工作），但视为 null origin（DOM 隔离 / 不能读 cookie）
+            // 故意 NOT 加 allow-same-origin / allow-top-navigation / allow-forms / allow-popups
+            text = `<iframe class="cv-msg-iframe" data-cv-iframe-id="${_escapeAttr(ifrId)}" `
+                 + `sandbox="allow-scripts" loading="lazy" referrerpolicy="no-referrer" `
+                 + `style="width:100%;border:0;background:transparent;min-height:120px;display:block;" `
+                 + `srcdoc="${_escapeAttr(wrapped)}"></iframe>`;
+        } else {
+            // m.text 已经过【酒馆正则 → strip → extract】处理（v0.5.17-regex.5 起在 _processed 缓存层完成）
+            text = m.text
+                ? ((_useRichRender
+                        ? sanitizeMd(renderRichMd(m.text), _sanitizeMode)
+                        : renderLiteMd(m.text))
+                    || '<span class="cv-reader-empty">（空）</span>')
+                : '<span class="cv-reader-empty">（空）</span>';
+        }
         // user 头像：若聊天 meta 里绑定了 persona 文件名，走 /thumbnail（零附加存储）；否则首字徽章
         const userAvHtml = boundUserAvatarUrl
             ? `<img class="cv-reader-msg-avatar" src="${boundUserAvatarUrl}" onerror="this.style.display='none'; this.nextElementSibling.style.display='inline-flex'" alt=""/><div class="cv-reader-msg-avatar cv-reader-user-avatar" style="display:none">${escapeHtml((m.who||'你').slice(0,1))}</div>`
